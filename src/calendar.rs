@@ -214,6 +214,7 @@ const CSS: &str = "
 .cal-today { color: @accent_color; font-weight: bold; }
 .cal-day { min-width: 26px; min-height: 26px; padding: 0; font-size: 0.85em; }
 .cal-busy { background-color: alpha(@accent_bg_color, 0.2); }
+.cal-lunch { background-color: alpha(@success_bg_color, 0.15); border: 1px dashed alpha(@success_bg_color, 0.7); border-radius: 6px; padding: 1px 6px; min-height: 0; font-size: 0.8em; }
 ";
 
 fn install_css() {
@@ -319,13 +320,33 @@ impl Cal {
         b
     }
 
+    fn lunch_bar(self: &Rc<Self>) -> gtk::Button {
+        let content = gtk::Box::builder().spacing(6).build();
+        content.append(&gtk::Image::from_icon_name("emoji-food-symbolic"));
+        content.append(&gtk::Label::new(Some(LUNCH.2)));
+        let b = gtk::Button::builder().child(&content).css_classes(["cal-lunch"]).tooltip_text("Open the mensa menu").build();
+        let weak = Rc::downgrade(self);
+        b.connect_clicked(move |_| {
+            if let Some(c) = weak.upgrade() {
+                (c.open)("m:mensa");
+            }
+        });
+        b
+    }
+
     fn day_view(self: &Rc<Self>, day: &glib::DateTime) -> gtk::Widget {
         let evs = self.on(day);
-        if evs.is_empty() {
+        let lunch = lunch_slot(day, &evs);
+        if evs.is_empty() && lunch.is_none() {
             return adw::StatusPage::builder().icon_name("x-office-calendar-symbolic").title("Nothing on this day").build().upcast();
         }
         let list = gtk::ListBox::builder().css_classes(["boxed-list"]).selection_mode(gtk::SelectionMode::None).valign(gtk::Align::Start).build();
-        for e in evs {
+        let lunch_row = || gtk::ListBoxRow::builder().child(&self.lunch_bar()).activatable(false).build();
+        let count = evs.len();
+        for (i, e) in evs.into_iter().enumerate() {
+            if lunch == Some(i) {
+                list.append(&lunch_row());
+            }
             let r = row(&e.title, &join(&[&when(&e), &e.detail]));
             r.add_prefix(&dot(e.kind));
             if !e.target.is_empty() {
@@ -339,6 +360,9 @@ impl Cal {
                 });
             }
             list.append(&r);
+        }
+        if lunch == Some(count) {
+            list.append(&lunch_row());
         }
         scrolled(&adw::Clamp::builder().maximum_size(800).child(&list).margin_top(6).margin_bottom(18).margin_start(12).margin_end(12).build())
     }
@@ -365,8 +389,16 @@ impl Cal {
             }
             grid.attach(&self.day_button(&head, &d), i, 0, 1, 1);
             let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-            for e in self.on(&d) {
-                col.append(&self.chip(&e, true));
+            let evs = self.on(&d);
+            let lunch = lunch_slot(&d, &evs);
+            for (j, e) in evs.iter().enumerate() {
+                if lunch == Some(j) {
+                    col.append(&self.lunch_bar());
+                }
+                col.append(&self.chip(e, true));
+            }
+            if lunch == Some(evs.len()) {
+                col.append(&self.lunch_bar());
             }
             grid.attach(&col, i, 1, 1, 1);
         }
@@ -452,6 +484,18 @@ impl Cal {
         }
         scrolled(&flow)
     }
+}
+
+/// Mensa lunch service. shortcut: fixed hours, not read from the mensa site; adjust here if they change.
+const LUNCH: (u32, u32, &str) = (12, 14, "Lunch · 12:00–14:00");
+
+/// Where the lunch bar goes among a day's sorted events; None on Sundays (mensa closed).
+fn lunch_slot(day: &glib::DateTime, evs: &[Event]) -> Option<usize> {
+    if day.day_of_week() == 7 {
+        return None;
+    }
+    let noon = midnight(day).to_unix() + LUNCH.0 as i64 * 3600;
+    Some(evs.iter().position(|e| !e.all_day && e.start >= noon).unwrap_or(evs.len()))
 }
 
 fn today_key() -> String {
@@ -591,5 +635,9 @@ mod tests {
         assert!(day[0].all_day);
         assert_eq!(hm(day[1].start), "09:00");
         assert_eq!(idx["2026-11-21"].len(), 1);
+        // Lunch goes after the morning events; no lunch on Sunday.
+        let fri = glib::DateTime::from_local(2026, 11, 20, 0, 0, 0.0).unwrap();
+        assert_eq!(lunch_slot(&fri, day), Some(2));
+        assert_eq!(lunch_slot(&fri.add_days(2).unwrap(), &[]), None);
     }
 }
