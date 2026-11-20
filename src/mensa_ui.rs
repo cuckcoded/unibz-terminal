@@ -14,71 +14,58 @@ use crate::auth::{self, Res};
 use crate::mensa::{self, AREA, BASE, DINNER, Dish, LUNCH, SNS_LOGIN};
 use crate::ui::*;
 
-/// Visible text of the reserved area, signing in with SNS when needed. The window only shows
-/// up if Microsoft needs interaction; otherwise everything happens in the background.
-async fn account_text() -> Res<String> {
+/// Signs in through "SNS Access UNIBZ" in a visible window and returns the reserved area's text.
+/// Microsoft usually completes on its own from the stored session; otherwise the user signs in there.
+async fn login_and_read() -> Res<String> {
     let view = auth::web_view();
-    let win = gtk::Window::builder().title("Sign in to the mensa").default_width(520).default_height(720).modal(true).child(&view).build();
+    let win = gtk::Window::builder().title("Signing in to the mensa…").default_width(520).default_height(720).child(&view).build();
     auth::set_parent(&win);
     let (tx, rx) = futures_channel::oneshot::channel::<Res<String>>();
     let tx = Rc::new(RefCell::new(Some(tx)));
-    // 0 = setting language, 1 = reserved area requested, 2 = SNS login started, 3 = reserved area after login, 4 = reading.
-    let stage = Rc::new(Cell::new(0u8));
-    let (weak, tx2) = (win.downgrade(), tx.clone());
-    let finish = Rc::new(move |r: Res<String>| {
-        if let Some(tx) = tx2.borrow_mut().take() {
-            let _ = tx.send(r);
-        }
-        if let Some(w) = weak.upgrade() {
-            w.close();
-        }
-    });
-    let weak = win.downgrade();
+    let send = {
+        let tx = tx.clone();
+        Rc::new(move |r: Res<String>| {
+            if let Some(tx) = tx.borrow_mut().take() {
+                let _ = tx.send(r);
+            }
+        })
+    };
+    // Each step is decided from where we landed, so unexpected redirects don't derail it.
+    let (tried_login, landings) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)));
     view.connect_load_changed(move |v, ev| {
         if ev != webkit6::LoadEvent::Finished {
             return;
         }
         let uri = v.uri().map(|u| u.to_string()).unwrap_or_default();
-        let login_page = uri.starts_with(&format!("{BASE}/auth"));
-        match stage.get() {
-            0 => {
-                stage.set(1);
-                v.load_uri(AREA);
-            }
-            4 => {}
-            s if login_page => {
-                if s == 1 {
-                    stage.set(2);
-                    v.load_uri(SNS_LOGIN);
-                } else {
-                    finish(Err("Mensa login did not succeed".into()));
-                }
-            }
-            // Microsoft sign-in: show the window in case it needs the user.
-            _ if !uri.starts_with(BASE) => {
-                if let Some(w) = weak.upgrade() {
-                    w.present();
-                }
-            }
-            2 if !uri.starts_with(AREA) => {
-                stage.set(3);
-                v.load_uri(AREA);
-            }
-            _ => {
-                stage.set(4);
-                let (v, finish) = (v.clone(), finish.clone());
-                glib::spawn_future_local(async move {
-                    // The page fills in parts with scripts; give it a few tries.
-                    for attempt in 0..6 {
-                        glib::timeout_future(Duration::from_millis(1500)).await;
-                        let text = v.evaluate_javascript_future("document.body.innerText", None, None).await.map(|j| j.to_str().to_string());
-                        match text {
-                            Ok(t) if mensa::parse_balance(&t).is_some() || attempt == 5 => return finish(Ok(t)),
-                            Ok(_) => {}
-                            Err(e) => return finish(Err(e.to_string())),
+        if uri.starts_with(AREA) {
+            let (v, send) = (v.clone(), send.clone());
+            glib::spawn_future_local(async move {
+                for attempt in 0..3 {
+                    match v.evaluate_javascript_future("document.body.innerText", None, None).await {
+                        Ok(j) => {
+                            let t = j.to_str().to_string();
+                            if mensa::parse_balance(&t).is_some() || attempt == 2 {
+                                return send(Ok(t));
+                            }
                         }
+                        Err(e) => return send(Err(e.to_string())),
                     }
-                });
+                    glib::timeout_future(Duration::from_millis(800)).await;
+                }
+            });
+        } else if uri.starts_with(&format!("{BASE}/auth")) {
+            if tried_login.replace(true) {
+                send(Err("the mensa did not accept the SNS sign-in".into()));
+            } else {
+                v.load_uri(SNS_LOGIN);
+            }
+        } else if uri.starts_with(BASE) && !uri.contains("/api/") {
+            // Signed in and dropped somewhere else on the site.
+            landings.set(landings.get() + 1);
+            if landings.get() > 3 {
+                send(Err("could not reach the reserved area".into()));
+            } else {
+                v.load_uri(AREA);
             }
         }
     });
@@ -86,14 +73,28 @@ async fn account_text() -> Res<String> {
         tx.borrow_mut().take();
         glib::Propagation::Proceed
     });
-    view.load_uri(&format!("{BASE}/change_language/en"));
-    let r = glib::future_with_timeout(Duration::from_secs(120), rx).await;
+    view.load_uri(AREA);
+    win.present();
+    let r = glib::future_with_timeout(Duration::from_secs(180), rx).await;
     win.close();
     match r {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => Err("mensa sign-in window closed".into()),
         Err(_) => Err("mensa sign-in timed out".into()),
     }
+}
+
+/// Reads the balance with the stored mensa session; signs in only when that session is gone.
+async fn fetch_credit() -> Res<f64> {
+    let cookie = auth::cookie_header(AREA).await;
+    if !cookie.is_empty() {
+        let r = gtk::gio::spawn_blocking(move || mensa::fetch_balance(&cookie)).await.unwrap_or_else(|_| Err("background job panicked".into()))?;
+        if let Some(b) = r {
+            return Ok(b);
+        }
+    }
+    let text = login_and_read().await?;
+    mensa::parse_balance(&text).ok_or_else(|| "could not find the balance on the reserved-area page".into())
 }
 
 #[derive(Default)]
@@ -133,7 +134,7 @@ pub async fn credit(force: bool) -> Res<f64> {
         Next::Done(v) => v,
         Next::Wait(rx) => rx.await.unwrap_or(Err("cancelled".into())),
         Next::Fetch => {
-            let r = account_text().await.and_then(|t| mensa::parse_balance(&t).ok_or("could not find the credit on the reserved-area page".into()));
+            let r = fetch_credit().await;
             let waiters = CREDIT.with(|c| {
                 let mut c = c.borrow_mut();
                 c.loading = false;

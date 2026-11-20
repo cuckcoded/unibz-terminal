@@ -530,12 +530,11 @@ pub fn page(data: &Data, access: &api::Access, open: Rc<dyn Fn(&str)>) -> gtk::W
             }
         });
     }
-    today.connect_clicked({
-        let weak = weak.clone();
-        move |_| {
-            if let (Some(c), Ok(d)) = (weak.upgrade(), glib::DateTime::now_local()) {
-                c.go(c.view.get(), midnight(&d));
-            }
+    // This closure owns the calendar state, so it lives exactly as long as the page; everything else holds it weakly.
+    let keep = cal.clone();
+    today.connect_clicked(move |_| {
+        if let Ok(d) = glib::DateTime::now_local() {
+            keep.go(keep.view.get(), midnight(&d));
         }
     });
 

@@ -137,6 +137,37 @@ fn find_amount(lines: &[&str], keys: &[&str]) -> Option<f64> {
     None
 }
 
+/// Visible text of an HTML page, one line per element.
+pub fn html_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        out.push('\n');
+        let tag = &rest[i..];
+        let lower = tag.get(..7).unwrap_or("").to_ascii_lowercase();
+        // Skip script and style bodies entirely.
+        let close = if lower.starts_with("<script") { "</script>" } else if lower.starts_with("<style") { "</style>" } else { ">" };
+        rest = match tag.find(close) {
+            Some(j) => &tag[j + close.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.replace("&euro;", "€").replace("&#8364;", "€").replace("&nbsp;", " ").replace("&amp;", "&")
+}
+
+/// Balance from the reserved area using the browser's session cookies; `None` when not signed in.
+pub fn fetch_balance(cookie: &str) -> Res<Option<f64>> {
+    // Not signed in = redirect to /auth, so don't follow redirects.
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let r = agent.get(AREA).set("Cookie", cookie).call().map_err(err)?;
+    if r.status() != 200 {
+        return Ok(None);
+    }
+    Ok(parse_balance(&html_text(&r.into_string().map_err(err)?)))
+}
+
 /// Credit balance from the reserved area's visible text, in any of the site's languages.
 pub fn parse_balance(text: &str) -> Option<f64> {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
@@ -161,6 +192,9 @@ mod tests {
         assert_eq!(parse_balance(t), Some(23.10));
         // As on the real reserved-area page.
         assert_eq!(parse_balance("Digital Wallet RistoCloud\nSaldo attuale: € 7,71\nRicarica"), Some(7.71));
+        // Markup as served (from a saved page).
+        let html = r#"<script>var credit = 99.99;</script><div class="bs4-col"> <h5 class="bs4-card-title text-uppercase">Digital Wallet RistoCloud</h5> </div> <div class="bs4-col"> <h5 class="text-right">Saldo attuale: € 7,71</h5>"#;
+        assert_eq!(parse_balance(&html_text(html)), Some(7.71));
     }
 
     #[test]
@@ -187,5 +221,16 @@ mod live {
         if let Some(d) = dishes.iter().find(|d| !d.image.is_empty()) {
             println!("image at {:?}", super::image(&d.image).unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod saved_page {
+    /// `MENSA_PAGE=<saved area-riservata.html> cargo test saved_area -- --ignored`
+    #[test]
+    #[ignore]
+    fn saved_area() {
+        let html = std::fs::read_to_string(std::env::var("MENSA_PAGE").unwrap()).unwrap();
+        assert!(super::parse_balance(&super::html_text(&html)).is_some());
     }
 }

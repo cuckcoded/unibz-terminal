@@ -208,6 +208,13 @@ pub fn forget_moodle() {
 }
 
 /// A WebView sharing the login cookies of the sign-in windows.
+/// "name=value; …" for the embedded browser's cookies that apply to `url`.
+pub async fn cookie_header(url: &str) -> String {
+    let Some(fut) = SESSION.with(|s| s.cookie_manager().map(|cm| cm.cookies_future(url))) else { return String::new() };
+    let cookies = fut.await.unwrap_or_default();
+    cookies.into_iter().filter_map(|mut c| Some(format!("{}={}", c.name()?, c.value()?))).collect::<Vec<_>>().join("; ")
+}
+
 pub fn web_view() -> webkit6::WebView {
     SESSION.with(|s| webkit6::WebView::builder().network_session(s).build())
 }
