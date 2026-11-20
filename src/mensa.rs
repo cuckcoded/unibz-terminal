@@ -159,6 +159,8 @@ mod tests {
     fn account_text() {
         let t = "Hello\nYour credit\n€ 23,10\nTariff band 2: 3,50 €\nTop up";
         assert_eq!(parse_balance(t), Some(23.10));
+        // As on the real reserved-area page.
+        assert_eq!(parse_balance("Digital Wallet RistoCloud\nSaldo attuale: € 7,71\nRicarica"), Some(7.71));
     }
 
     #[test]

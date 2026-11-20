@@ -115,14 +115,7 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         r
     };
 
-    let g = group("Coming up this week");
-    if week.is_empty() {
-        g.add(&row("No lectures in the next 7 days", ""));
-    }
-    for (c, l) in week.iter().take(15) {
-        g.add(&course_row(&format!("{}–{} · {}", fmt_local(&l.start, "%a %d %b, %H:%M"), l.end.get(11..16).unwrap_or(""), c.name), &format!("{} · {}", l.activity, l.room), c));
-    }
-    page.add(&g);
+    page.add(&lectures_day(data, open.clone()));
 
     let g = group("Upcoming exams");
     if exams.is_empty() {
@@ -198,6 +191,69 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         page.add(&g);
     }
     page
+}
+
+/// Lectures of one day, with buttons to move between days.
+fn lectures_day(data: &Data, open: Rc<dyn Fn(&str)>) -> adw::PreferencesGroup {
+    let g = group("");
+    let all: Rc<Vec<(i64, String, crate::api::Lecture)>> = Rc::new({
+        let mut v: Vec<_> = data.courses.iter().flat_map(|c| c.lectures.iter().map(move |l| (c.id, c.name.clone(), l.clone()))).collect();
+        v.sort_by(|a, b| a.2.start.cmp(&b.2.start));
+        v
+    });
+    let nav = gtk::Box::builder().css_classes(["linked"]).valign(gtk::Align::Center).build();
+    let prev = gtk::Button::builder().icon_name("go-previous-symbolic").tooltip_text("Previous day").build();
+    let today = gtk::Button::builder().label("Today").build();
+    let next = gtk::Button::builder().icon_name("go-next-symbolic").tooltip_text("Next day").build();
+    for b in [&prev, &today, &next] {
+        nav.append(b);
+    }
+    g.set_header_suffix(Some(&nav));
+    let offset = Rc::new(std::cell::Cell::new(0));
+    let rows: Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = Rc::default();
+    let render = Rc::new({
+        let (g, offset) = (g.clone(), offset.clone());
+        move || {
+            for r in rows.borrow_mut().drain(..) {
+                g.remove(&r);
+            }
+            let Ok(day) = glib::DateTime::now_local().and_then(|d| d.add_days(offset.get())) else { return };
+            let date = day.format("%A %d %B").map(|s| s.to_string()).unwrap_or_default();
+            g.set_title(&esc(&match offset.get() {
+                0 => format!("Today · {date}"),
+                1 => format!("Tomorrow · {date}"),
+                -1 => format!("Yesterday · {date}"),
+                _ => date,
+            }));
+            let key = day.format("%Y-%m-%d").map(|s| s.to_string()).unwrap_or_default();
+            let mut any = false;
+            for (id, name, l) in all.iter().filter(|x| x.2.start.starts_with(key.as_str())) {
+                any = true;
+                let title = format!("{}–{} · {name}", l.start.get(11..16).unwrap_or(""), l.end.get(11..16).unwrap_or(""));
+                let r = row(&title, &[l.activity.as_str(), l.room.as_str()].iter().filter(|x| !x.is_empty()).copied().collect::<Vec<_>>().join(" · "));
+                r.set_activatable(true);
+                r.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let (open, key) = (open.clone(), format!("c:{id}"));
+                r.connect_activated(move |_| open(&key));
+                g.add(&r);
+                rows.borrow_mut().push(r);
+            }
+            if !any {
+                let r = row("No lectures", "");
+                g.add(&r);
+                rows.borrow_mut().push(r);
+            }
+        }
+    });
+    for (b, delta) in [(&prev, -1), (&today, 0), (&next, 1)] {
+        let (offset, render) = (offset.clone(), render.clone());
+        b.connect_clicked(move |_| {
+            offset.set(if delta == 0 { 0 } else { offset.get() + delta });
+            render();
+        });
+    }
+    render();
+    g
 }
 
 #[cfg(test)]

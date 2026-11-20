@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod calendar;
 mod home;
 mod mensa;
 mod mensa_ui;
@@ -160,6 +161,9 @@ fn populate(ui: &Rc<Ui>, select: Option<&str>) {
     let home = adw::ActionRow::builder().title("Home").subtitle("Overview and statistics").name("h:home").build();
     home.add_prefix(&gtk::Image::from_icon_name("go-home-symbolic"));
     ui.list.append(&home);
+    let cal = adw::ActionRow::builder().title("Calendar").subtitle("Lectures, exams and deadlines").name("k:calendar").build();
+    cal.add_prefix(&gtk::Image::from_icon_name("x-office-calendar-symbolic"));
+    ui.list.append(&cal);
     let mensa = adw::ActionRow::builder().title("Mensa").subtitle("Credit and menu").name("m:mensa").build();
     mensa.add_prefix(&gtk::Image::from_icon_name("emoji-food-symbolic"));
     ui.list.append(&mensa);
@@ -229,15 +233,16 @@ fn toggle_folder(ui: &Ui, folder: &gtk::ListBoxRow) {
 fn show(ui: &Rc<Ui>, key: &str) {
     let Some(state) = ui.state.borrow().clone() else { return };
     let (kind, id) = key.split_once(':').unwrap_or_default();
+    let weak = Rc::downgrade(ui);
+    let open: Rc<dyn Fn(&str)> = Rc::new(move |key| {
+        if let Some(ui) = weak.upgrade() {
+            select_key(&ui, key);
+        }
+    });
     let (title, page) = match kind {
+        "k" => ("Calendar".to_owned(), toolbar(&calendar::page(&state.data.borrow(), &state.access, open), Some(adw::WindowTitle::new("Calendar", "").upcast_ref()), &[])),
         "h" => {
             let ole = state.access.moodle.clone();
-            let weak = Rc::downgrade(ui);
-            let open: Rc<dyn Fn(&str)> = Rc::new(move |key| {
-                if let Some(ui) = weak.upgrade() {
-                    select_key(&ui, key);
-                }
-            });
             ("Home".to_owned(), toolbar(&home::page(&state.data.borrow(), ole, open), Some(adw::WindowTitle::new("Home", "").upcast_ref()), &[]))
         }
         "m" => ("Mensa".to_owned(), toolbar(&mensa_ui::page(), Some(adw::WindowTitle::new("Mensa", "").upcast_ref()), &[])),
