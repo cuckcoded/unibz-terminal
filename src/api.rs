@@ -22,6 +22,8 @@ pub struct Access {
 
 #[derive(Clone, Default)]
 pub struct Lecture {
+    /// Timetable ActivityCode: LECT, LAB or EXAM.
+    pub kind: String,
     pub start: String,
     pub end: String,
     pub activity: String,
@@ -48,6 +50,26 @@ pub struct Course {
     pub moodle: Vec<(i64, String)>,
     /// (group id, name, Teams web link)
     pub teams: Vec<(String, String, String)>,
+}
+
+impl Course {
+    pub fn passed(&self) -> bool {
+        self.mark.is_some() || self.status == "Passed"
+    }
+
+    /// Earliest exam not yet over, from the timetable (EXAM entries) or open exam sessions:
+    /// (local ISO start, description). `now` is local "YYYY-MM-DDTHH:MM:SS".
+    pub fn next_exam(&self, now: &str) -> Option<(String, String)> {
+        let timetable = self.lectures.iter().filter(|l| l.kind == "EXAM" && l.end.as_str() >= now).map(|l| (l.start.clone(), [l.activity.clone(), l.room.clone()].join(" · ")));
+        let sessions = self.exams.iter().filter_map(|e| {
+            let date = s(&e["examDate"]).get(..10)?.to_owned();
+            let time = s(&e["examTime"]);
+            let start = format!("{date}T{}:00", time.get(..5).filter(|t| t.contains(':')).unwrap_or("23:59"));
+            let desc = [s(&e["examTypeDescription"]), s(&e["location"])].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
+            (start.as_str() >= now).then_some((start, desc))
+        });
+        timetable.chain(sessions).min_by(|a, b| a.0.cmp(&b.0))
+    }
 }
 
 pub struct Data {
@@ -189,6 +211,7 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
                     }
                 }
                 entry.0.push(Lecture {
+                    kind: s(&e["ActivityCode"]).to_uppercase(),
                     start: s(&e["StartDate"]),
                     end: s(&e["EndDate"]),
                     activity: s(&e["ActivityDescription"]),
@@ -329,6 +352,19 @@ mod tests {
         assert_eq!(pick("analysis", &c), vec![&2]);
         assert_eq!(pick("Network-Security 2025/26", &c), vec![&3]);
         assert!(pick("Databases", &c).is_empty());
+    }
+
+    #[test]
+    fn next_exam_picks_earliest_upcoming() {
+        let lect = |kind: &str, start: &str| Lecture { kind: kind.into(), start: start.into(), end: start.into(), ..Default::default() };
+        let c = Course {
+            lectures: vec![lect("EXAM", "2026-01-10T09:00:00"), lect("LECT", "2026-01-05T09:00:00"), lect("EXAM", "2026-02-10T09:00:00")],
+            exams: vec![serde_json::json!({"examDate": "2026-01-20T00:00:00", "examTime": "14:00"})],
+            ..Default::default()
+        };
+        assert_eq!(c.next_exam("2026-01-01T00:00:00").unwrap().0, "2026-01-10T09:00:00");
+        assert_eq!(c.next_exam("2026-01-11T00:00:00").unwrap().0, "2026-01-20T14:00:00");
+        assert!(c.next_exam("2026-03-01T00:00:00").is_none());
     }
 
     #[test]

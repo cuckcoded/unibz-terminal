@@ -240,6 +240,16 @@ pub fn fmt_ts(ts: i64) -> String {
     glib::DateTime::from_unix_local(ts).ok().and_then(|d| d.format("%a %d %b %Y, %H:%M").ok()).map_or(String::new(), |s| s.to_string())
 }
 
+/// Local now as "YYYY-MM-DDTHH:MM:SS" (mySNS timetable times are local, without zone).
+pub fn now_local() -> String {
+    glib::DateTime::now_local().ok().and_then(|d| d.format("%Y-%m-%dT%H:%M:%S").ok()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// Formats a zone-less local ISO time from mySNS.
+pub fn fmt_local(iso: &str, fmt: &str) -> String {
+    glib::DateTime::from_iso8601(iso, Some(&glib::TimeZone::local())).ok().and_then(|d| d.format(fmt).ok()).map_or(iso.to_owned(), |s| s.to_string())
+}
+
 pub fn fmt_iso(iso: &str) -> String {
     glib::DateTime::from_iso8601(iso, Some(&glib::TimeZone::utc()))
         .ok()

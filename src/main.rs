@@ -136,10 +136,15 @@ fn populate(ui: &Rc<Ui>, select: Option<&str>) {
     let data = state.data.borrow();
     ui.list.remove_all();
 
+    let now = now_local();
     let mut folders: BTreeMap<(u8, String), Vec<(String, String, String)>> = BTreeMap::new();
     for c in &data.courses {
         let folder = if is_current(c) { (0, "This semester".into()) } else { (1, format!("Year {}", c.degree_year)) };
-        let sub = if c.mark.is_some() { grade(c) } else { c.status.clone() };
+        let sub = match (c.passed(), c.next_exam(&now)) {
+            (true, _) => grade(c),
+            (false, Some((when, _))) => format!("Exam {}", fmt_local(&when, "%a %d %b")),
+            (false, None) => c.status.clone(),
+        };
         folders.entry(folder).or_default().push((format!("c:{}", c.id), c.name.clone(), sub));
     }
     let linked_ole: HashSet<i64> = data.courses.iter().flat_map(|c| c.moodle.iter().map(|m| m.0)).collect();
@@ -349,10 +354,19 @@ fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage 
     let page = adw::PreferencesPage::new();
     let data = state.data.borrow();
 
-    let g = group("Grade");
-    g.add(&row("Status", &grade(c)));
-    if let Some(d) = &c.exam_date {
-        g.add(&row("Exam date", d));
+    let now = now_local();
+    let g = group("Result");
+    if c.passed() {
+        g.add(&row("Grade", &grade(c)));
+        if let Some(d) = &c.exam_date {
+            g.add(&row("Exam date", d));
+        }
+    } else {
+        match c.next_exam(&now) {
+            Some((when, desc)) => g.add(&row(&format!("Next exam: {}", fmt_local(&when, "%A %d %B %Y, %H:%M")), &desc)),
+            None => g.add(&row("Next exam", "No exam appointment in mySNS yet")),
+        }
+        g.add(&row("Status", &c.status));
     }
     g.add(&row("Credits", &format!("{} ECTS · year {} · code {}", c.credits, c.degree_year, c.code)));
     if let Some(u) = &c.syllabus {
@@ -368,9 +382,13 @@ fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage 
     }
     page.add(&g);
 
-    let g = group("Exam sessions");
-    if c.exams.is_empty() {
-        g.add(&row("No exam sessions open", "From mySNS exam enrolment"));
+    let g = group("Exams");
+    let exam_slots: Vec<_> = c.lectures.iter().filter(|l| l.kind == "EXAM").collect();
+    if c.exams.is_empty() && exam_slots.is_empty() {
+        g.add(&row("No exam appointments", "From the mySNS calendar and exam enrolment"));
+    }
+    for l in exam_slots {
+        g.add(&row(&format!("{} · {}", fmt_local(&l.start, "%a %d %b %Y, %H:%M"), l.room), &format!("{} · {}", l.activity, l.staff)));
     }
     for e in &c.exams {
         let f = |k: &str| api::s(&e[k]);
@@ -385,15 +403,12 @@ fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage 
     }
     page.add(&g);
 
-    let now = glib::DateTime::now_local().ok().and_then(|d| d.format("%Y-%m-%dT%H:%M:%S").ok()).map(|s| s.to_string()).unwrap_or_default();
-    let upcoming: Vec<_> = c.lectures.iter().filter(|l| l.end >= now).collect();
+    let lectures: Vec<_> = c.lectures.iter().filter(|l| l.kind != "EXAM").collect();
+    let upcoming: Vec<_> = lectures.iter().filter(|l| l.end >= now).collect();
     let g = group("Lectures");
-    g.set_description(Some(&format!("{} upcoming, {} past this academic year", upcoming.len(), c.lectures.len() - upcoming.len())));
+    g.set_description(Some(&format!("{} upcoming, {} past this academic year", upcoming.len(), lectures.len() - upcoming.len())));
     for l in upcoming.iter().take(30) {
-        let date = glib::DateTime::from_iso8601(&l.start, Some(&glib::TimeZone::local()))
-            .ok()
-            .and_then(|d| d.format("%a %d %b, %H:%M").ok())
-            .map_or(l.start.clone(), |s| s.to_string());
+        let date = fmt_local(&l.start, "%a %d %b, %H:%M");
         let end = l.end.get(11..16).unwrap_or("");
         g.add(&row(&format!("{date}–{end} · {}", l.room), &format!("{} · {}", l.activity, l.staff)));
     }
