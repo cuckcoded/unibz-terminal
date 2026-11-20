@@ -33,6 +33,7 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 
 1. Every mySNS timetable entry carries its OLE course id and Teams group id. These are used first.
 2. If a course has neither, it is matched to OLE courses and teams by name.
+   Timetable links to OLE courses you are not enrolled in, or teams you have not joined, appear under **Suggested by mySNS**. **Enrol** self-enrols you on OLE and asks for an enrolment key if one is needed. **Join** tries to add you to the team, and otherwise shows the join code from mySNS.
 3. To change a match, use **Assign…** or the unlink buttons on the mySNS tab, or **Assign to course…** on an unlinked OLE course or team. Changes are saved to `~/.config/unibz-terminal/config.json`, which you can also edit by hand:
 
 ```json

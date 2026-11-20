@@ -282,6 +282,11 @@ enum Link {
 
 /// Adds/removes a link on a course, saves it as an override, and refreshes the sidebar.
 fn change_link(ui: &Rc<Ui>, state: &State, course_id: i64, link: Link, add: bool) {
+    save_link(ui, state, course_id, link, add, true)
+}
+
+/// `persist`: write an override even if the course had none (a new enrolment is found again automatically).
+fn save_link(ui: &Rc<Ui>, state: &State, course_id: i64, link: Link, add: bool, persist: bool) {
     let mut data = state.data.borrow_mut();
     let Some(c) = data.courses.iter_mut().find(|c| c.id == course_id) else { return };
     match (link, add) {
@@ -291,9 +296,11 @@ fn change_link(ui: &Rc<Ui>, state: &State, course_id: i64, link: Link, add: bool
         (Link::Team(t), false) => c.teams.retain(|x| x.0 != t.0),
     }
     let mut cfg = auth::config();
-    cfg.overrides.insert(c.code.clone(), auth::Override { moodle: c.moodle.iter().map(|m| m.0).collect(), teams: c.teams.iter().map(|t| t.0.clone()).collect() });
-    if let Err(e) = auth::save_config(&cfg) {
-        eprintln!("saving config: {e}");
+    if persist || cfg.overrides.contains_key(&c.code) {
+        cfg.overrides.insert(c.code.clone(), auth::Override { moodle: c.moodle.iter().map(|m| m.0).collect(), teams: c.teams.iter().map(|t| t.0.clone()).collect() });
+        if let Err(e) = auth::save_config(&cfg) {
+            eprintln!("saving config: {e}");
+        }
     }
     drop(data);
     populate(ui, Some(&format!("c:{course_id}")));
@@ -348,6 +355,100 @@ fn assign_to_course_button(ui: &Rc<Ui>, state: &Rc<State>, link: Link) -> gtk::W
         choose(b, "Assign to mySNS course", options);
     })
     .upcast()
+}
+
+/// After enrolling/joining: it is no longer a suggestion anywhere, and becomes a linked tab here.
+fn enrolled(ui: &Rc<Ui>, state: &Rc<State>, course_id: i64, link: Link) {
+    {
+        let mut d = state.data.borrow_mut();
+        match &link {
+            Link::Ole(id, name) => {
+                d.ole.push((*id, name.clone()));
+                d.courses.iter_mut().for_each(|c| c.suggest_moodle.retain(|m| m.0 != *id));
+            }
+            Link::Team(t) => {
+                d.teams.push(t.clone());
+                d.courses.iter_mut().for_each(|c| c.suggest_teams.retain(|x| x.0 != t.0));
+            }
+        }
+    }
+    save_link(ui, state, course_id, link, true, false);
+}
+
+fn suggestions(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> Option<adw::PreferencesGroup> {
+    if c.suggest_moodle.is_empty() && c.suggest_teams.is_empty() {
+        return None;
+    }
+    let g = group("Suggested by mySNS");
+    g.set_description(Some("The mySNS timetable links these to this course, but you are not enrolled yet."));
+    for (id, name) in &c.suggest_moodle {
+        let r = row(name, "OLE course · not enrolled");
+        r.add_suffix(&link_button("Open", format!("{}/course/view.php?id={id}", auth::OLE)));
+        let (ui, state, cid, id, name) = (ui.clone(), state.clone(), c.id, *id, name.clone());
+        r.add_suffix(&button("Enrol", move |b| {
+            let Ok(token) = state.access.moodle.clone() else { return alert(b, "OLE unavailable", "Not signed in to OLE.") };
+            let (ui, state, name, b) = (ui.clone(), state.clone(), name.clone(), b.clone());
+            b.set_sensitive(false);
+            glib::spawn_future_local(async move {
+                let mut key: Option<String> = None;
+                loop {
+                    let (t, k) = (token.clone(), key.clone());
+                    match gio::spawn_blocking(move || moodle::self_enrol(&t, id, k.as_deref())).await.unwrap_or_else(|_| Err("panicked".into())) {
+                        Ok(()) => return enrolled(&ui, &state, cid, Link::Ole(id, name)),
+                        // Usually means an enrolment key is required (or the one given was wrong).
+                        Err(e) if !e.contains("no self-enrolment") => match ask_line(&b, "Enrolment key", &e, "Key from the lecturer").await {
+                            Some(k) => key = Some(k),
+                            None => break,
+                        },
+                        Err(e) => {
+                            alert(&b, "Could not enrol", &e);
+                            break;
+                        }
+                    }
+                }
+                b.set_sensitive(true);
+            });
+        }));
+        g.add(&r);
+    }
+    for (gid, name, url, code) in &c.suggest_teams {
+        let r = row(name, &if code.is_empty() { "Team · not joined".into() } else { format!("Team · not joined · join code {code}") });
+        let (ui, state, cid, team, code) = (ui.clone(), state.clone(), c.id, (gid.clone(), name.clone(), url.clone()), code.clone());
+        r.add_suffix(&button("Join", move |b| {
+            let Ok(token) = state.access.graph.clone() else { return alert(b, "Teams unavailable", "Not signed in to Microsoft.") };
+            let (ui, state, team, code, b) = (ui.clone(), state.clone(), team.clone(), code.clone(), b.clone());
+            b.set_sensitive(false);
+            let gid = team.0.clone();
+            spawn(
+                move || {
+                    let me = api::get(&format!("{}/me?$select=id", api::GRAPH), Some(&token))?;
+                    let body = serde_json::json!({ "@odata.id": format!("{}/directoryObjects/{}", api::GRAPH, api::s(&me["id"])) });
+                    api::post_json(&format!("{}/groups/{gid}/members/$ref", api::GRAPH), Some(&token), &body)
+                },
+                move |r| match r {
+                    Ok(_) => enrolled(&ui, &state, cid, Link::Team(team)),
+                    Err(e) => {
+                        b.set_sensitive(true);
+                        // Private class teams only accept the join code, which Graph cannot redeem.
+                        let dialog = adw::AlertDialog::new(
+                            Some("Join in Teams"),
+                            Some(&format!("Joining automatically was refused ({}).\n\nJoin code: {}", e.chars().take(160).collect::<String>(), if code.is_empty() { "none in mySNS" } else { &code })),
+                        );
+                        dialog.add_responses(&[("close", "Close"), ("open", "Copy code and open Teams")]);
+                        dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+                        let (b2, url) = (b.clone(), team.2.clone());
+                        dialog.connect_response(Some("open"), move |_, _| {
+                            b2.clipboard().set_text(&code);
+                            open_uri(&b2, if url.is_empty() { "https://teams.microsoft.com/" } else { &url });
+                        });
+                        dialog.present(Some(&b));
+                    }
+                },
+            );
+        }));
+        g.add(&r);
+    }
+    Some(g)
 }
 
 fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage {
@@ -414,6 +515,9 @@ fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage 
     }
     page.add(&g);
 
+    if let Some(g) = suggestions(ui, state, c) {
+        page.add(&g);
+    }
     let g = group("Linked OLE courses and teams");
     g.set_description(Some("Changes are saved to ~/.config/unibz-terminal/config.json"));
     let links: Vec<(String, &str, Link)> = c

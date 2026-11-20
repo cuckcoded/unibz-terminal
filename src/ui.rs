@@ -171,6 +171,23 @@ pub async fn confirm(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str, 
     dialog.choose_future(Some(parent)).await == "ok"
 }
 
+/// Asks for a single line (e.g. an enrolment key). Returns None when cancelled.
+pub async fn ask_line(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str, placeholder: &str) -> Option<String> {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "OK")]);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    let entry = gtk::PasswordEntry::builder().placeholder_text(placeholder).show_peek_icon(true).activates_default(true).build();
+    dialog.set_extra_child(Some(&entry));
+    dialog.set_default_response(Some("ok"));
+    (dialog.choose_future(Some(parent)).await == "ok").then(|| entry.text().into())
+}
+
+pub fn alert(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str) {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_response("close", "Close");
+    dialog.present(Some(parent));
+}
+
 /// Plain text as HTML paragraphs.
 pub fn text_to_html(t: &str) -> String {
     t.split("\n\n").map(|p| format!("<p>{}</p>", esc(p).replace('\n', "<br>"))).collect()

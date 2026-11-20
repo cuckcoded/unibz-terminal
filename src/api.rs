@@ -50,6 +50,10 @@ pub struct Course {
     pub moodle: Vec<(i64, String)>,
     /// (group id, name, Teams web link)
     pub teams: Vec<(String, String, String)>,
+    /// OLE courses the timetable links to this course that you are not enrolled in.
+    pub suggest_moodle: Vec<(i64, String)>,
+    /// Teams the timetable links to this course that you have not joined: (group id, name, web link, join code).
+    pub suggest_teams: Vec<(String, String, String, String)>,
 }
 
 impl Course {
@@ -203,6 +207,7 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
 
     // Timetable for the current academic year, grouped by course name.
     let mut team_urls: HashMap<String, String> = HashMap::new();
+    let mut team_codes: HashMap<String, String> = HashMap::new();
     let mut by_course: BTreeMap<String, (Vec<Lecture>, BTreeSet<i64>, BTreeSet<String>)> = BTreeMap::new();
     match timetable(a, &q) {
         Ok(entries) => {
@@ -217,6 +222,9 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
                 for p in staff {
                     if let Some((u, g)) = p["TeamsUrl"].as_str().and_then(|u| Some((u, query_param(u, "groupId")?))) {
                         team_urls.insert(g.clone(), u.to_owned());
+                        if let Some(code) = p["TeamsJoinCode"].as_str().or(e["TeamsJoinCode"].as_str()) {
+                            team_codes.insert(g.clone(), code.to_owned());
+                        }
                         entry.2.insert(g);
                     }
                 }
@@ -242,13 +250,16 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         Err(e) => (warn("Exams login", e.clone()), vec![]).1,
     };
 
-    let mut ole_user = None;
+    let (mut ole_user, mut ole_known, mut teams_known) = (None, false, false);
     let ole: Vec<(String, (i64, String))> = match &a.moodle {
         Ok(t) => match moodle::call(t, "core_webservice_get_site_info", &[]).and_then(|si| {
             ole_user = si["userid"].as_i64();
             moodle::call(t, "core_enrol_get_users_courses", &[("userid", s(&si["userid"]))])
         }) {
-            Ok(v) => arr(&v).iter().map(|c| (s(&c["fullname"]), (c["id"].as_i64().unwrap_or_default(), s(&c["fullname"])))).collect(),
+            Ok(v) => {
+                ole_known = true;
+                arr(&v).iter().map(|c| (s(&c["fullname"]), (c["id"].as_i64().unwrap_or_default(), s(&c["fullname"])))).collect()
+            }
             Err(e) => (warn("OLE", e), vec![]).1,
         },
         Err(e) => (warn("OLE login", e.clone()), vec![]).1,
@@ -259,6 +270,7 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         Ok(t) => match get(&format!("{GRAPH}/me/joinedTeams?$select=id,displayName,webUrl"), Some(t)) {
             Ok(v) => arr(&v["value"])
                 .iter()
+                .inspect(|_| teams_known = true)
                 .map(|t| {
                     if let Some(u) = t["webUrl"].as_str() {
                         team_urls.entry(s(&t["id"])).or_insert(u.to_owned());
@@ -288,10 +300,25 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         if t_ids.is_empty() {
             t_ids.extend(pick(&c.name, &teams).into_iter().map(|(id, _)| id.clone()));
         }
+        // Timetable links you can't open yet become suggestions (only when the enrolment lists loaded).
+        let mut sugg_m = BTreeSet::new();
+        let mut sugg_t = BTreeSet::new();
+        if ole_known {
+            (m_ids, sugg_m) = m_ids.into_iter().partition(|id| ole_names.contains_key(id));
+        }
+        if teams_known {
+            (t_ids, sugg_t) = t_ids.into_iter().partition(|id| team_names.contains_key(id));
+        }
         if let Some(o) = cfg.overrides.get(&c.code) {
             m_ids = o.moodle.iter().copied().collect();
             t_ids = o.teams.iter().cloned().collect();
         }
+        c.suggest_moodle = sugg_m.into_iter().filter(|id| !m_ids.contains(id)).map(|id| (id, format!("OLE course {id}"))).collect();
+        c.suggest_teams = sugg_t
+            .into_iter()
+            .filter(|id| !t_ids.contains(id))
+            .map(|id| (id.clone(), "Team".into(), team_urls.get(&id).cloned().unwrap_or_default(), team_codes.get(&id).cloned().unwrap_or_default()))
+            .collect();
         c.moodle = m_ids.into_iter().map(|id| (id, ole_names.get(&id).cloned().unwrap_or(format!("OLE course {id}")))).collect();
         c.teams = t_ids
             .into_iter()
@@ -309,6 +336,7 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
             .cloned()
             .collect();
     }
+    name_suggestions(a, &mut courses);
     // Current courses first, then open ones, then passed.
     courses.sort_by_key(|c| (c.lectures.is_empty() && c.exams.is_empty(), c.status == "Passed", c.degree_year, c.name.clone()));
     let teams = teams.into_iter().map(|(_, (id, name))| {
@@ -316,6 +344,38 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         (id, name, url)
     });
     Ok(Data { student_id: sid, query: q, courses, warnings, ole_user, ole: ole.into_iter().map(|(_, c)| c).collect(), teams: teams.collect() })
+}
+
+/// Looks up names of suggested courses you can't see in your own lists. Best effort.
+fn name_suggestions(a: &Access, courses: &mut [Course]) {
+    let ids: BTreeSet<i64> = courses.iter().flat_map(|c| c.suggest_moodle.iter().map(|m| m.0)).collect();
+    let mut names: HashMap<String, String> = HashMap::new();
+    if let (Ok(t), false) = (&a.moodle, ids.is_empty()) {
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        if let Ok(v) = moodle::call(t, "core_course_get_courses_by_field", &[("field", "ids".into()), ("value", list)]) {
+            names.extend(arr(&v["courses"]).iter().map(|c| (s(&c["id"]), s(&c["fullname"]))));
+        }
+    }
+    let groups: BTreeSet<String> = courses.iter().flat_map(|c| c.suggest_teams.iter().map(|t| t.0.clone())).collect();
+    if let Ok(t) = &a.graph {
+        for g in groups {
+            if let Ok(v) = get(&format!("{GRAPH}/groups/{g}?$select=displayName"), Some(t)) {
+                names.insert(g, s(&v["displayName"]));
+            }
+        }
+    }
+    for c in courses {
+        for m in &mut c.suggest_moodle {
+            if let Some(n) = names.get(&m.0.to_string()) {
+                m.1 = n.clone();
+            }
+        }
+        for t in &mut c.suggest_teams {
+            if let Some(n) = names.get(&t.0) {
+                t.1 = n.clone();
+            }
+        }
+    }
 }
 
 fn timetable(a: &Access, q: &str) -> Res<Vec<Value>> {

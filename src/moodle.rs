@@ -62,6 +62,25 @@ pub fn upload(token: &str, itemid: i64, filename: &str, bytes: &[u8]) -> Res<i64
     v[0]["itemid"].as_i64().ok_or_else(|| format!("upload failed: {}", s(&v["error"])))
 }
 
+/// Self-enrols in a course. `Err` carries OLE's reason (e.g. an enrolment key is required).
+pub fn self_enrol(token: &str, course: i64, password: Option<&str>) -> Res<()> {
+    let methods = call(token, "core_enrol_get_course_enrolment_methods", &[("courseid", course.to_string())])?;
+    let m = crate::api::arr(&methods)
+        .iter()
+        .find(|m| m["type"] == "self" && (m["status"] == true || s(&m["status"]) == "1"))
+        .ok_or("This course has no self-enrolment. Ask the lecturer, or open the course on OLE.")?;
+    let mut args = vec![("courseid", course.to_string()), ("instanceid", s(&m["id"]))];
+    if let Some(p) = password {
+        args.push(("password", p.to_owned()));
+    }
+    let r = call(token, "enrol_self_enrol_user", &args)?;
+    if r["status"] == true {
+        return Ok(());
+    }
+    let why: Vec<String> = crate::api::arr(&r["warnings"]).iter().map(|w| s(&w["message"])).collect();
+    Err(if why.is_empty() { "OLE refused the enrolment".into() } else { why.join("; ") })
+}
+
 /// A URL that logs the embedded browser into OLE, then continues to `url`.
 pub fn autologin(token: &str, private: Option<&str>, user: Option<i64>, url: &str) -> String {
     let (Some(p), Some(user)) = (private, user) else { return url.to_owned() };
