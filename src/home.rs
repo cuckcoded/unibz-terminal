@@ -9,15 +9,20 @@ use crate::moodle;
 use crate::ui::*;
 
 fn stat_card(value: &str, caption: &str, extra: Option<&gtk::Widget>) -> gtk::Box {
+    stat_card_with_label(value, caption, extra).0
+}
+
+fn stat_card_with_label(value: &str, caption: &str, extra: Option<&gtk::Widget>) -> (gtk::Box, gtk::Label) {
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["card"]).build();
     let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(14).margin_bottom(14).margin_start(16).margin_end(16).build();
-    inner.append(&gtk::Label::builder().label(value).css_classes(["title-2"]).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build());
+    let value_label = gtk::Label::builder().label(value).css_classes(["title-2"]).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    inner.append(&value_label);
     inner.append(&gtk::Label::builder().label(caption).css_classes(["caption", "dim-label"]).xalign(0.0).wrap(true).build());
     if let Some(w) = extra {
         inner.append(w);
     }
     b.append(&inner);
-    b
+    (b, value_label)
 }
 
 fn num(v: &serde_json::Value) -> Option<f64> {
@@ -80,6 +85,23 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         None,
     ));
     flow.append(&stat_card(&week.len().to_string(), "Lectures in the next 7 days", None));
+    let (card, credit) = stat_card_with_label("…", "Mensa credit", None);
+    card.set_tooltip_text(Some("Open the mensa"));
+    card.set_cursor_from_name(Some("pointer"));
+    let click = gtk::GestureClick::new();
+    let open_mensa = open.clone();
+    click.connect_released(move |_, _, _, _| open_mensa("m:mensa"));
+    card.add_controller(click);
+    glib::spawn_future_local(async move {
+        match crate::mensa_ui::credit(false).await {
+            Ok(v) => credit.set_label(&crate::mensa_ui::euros(v)),
+            Err(e) => {
+                credit.set_label("?");
+                credit.set_tooltip_text(Some(&e));
+            }
+        }
+    });
+    flow.append(&card);
     let g = adw::PreferencesGroup::new();
     g.add(&flow);
     page.add(&g);

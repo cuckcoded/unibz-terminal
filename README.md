@@ -24,9 +24,9 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 
 - **Home:** your profile, plus stat cards for ECTS progress, weighted average, projected base grade, passed exams, next exam and this week's lectures. It also lists the week's lectures, upcoming exams, OLE deadlines across all courses, recent results and any loading problems.
 - **Mensa:**
-  - Your credit, read from the mensa reserved area. Sign-in uses the "SNS Access UNIBZ" button with your existing Microsoft session.
-  - How many meals the credit covers, using a price per meal you can edit. The price is filled in from the site if it shows one.
-  - Lunch and dinner for today and the following days at Bolzano, Bressanone or NOI, with allergens. The menu needs no login.
+  - Your credit, read from the mensa reserved area. Sign-in uses the "SNS Access UNIBZ" button with your existing Microsoft session. The credit also appears on Home.
+  - The menu, one day at a time. Buttons move to the previous day, today or the next day. Dropdowns pick lunch or dinner and the location (Bolzano, Bressanone or NOI).
+  - One column per dish type (first courses, second courses, sides…), each dish with its photo and name. Hover a dish for its allergens; click it to open its page.
 - **Sidebar folders:**
   - **This semester:** courses with lectures in the last two weeks or later, or with exam sessions.
   - **Year 1, 2, 3:** the rest of your study plan.

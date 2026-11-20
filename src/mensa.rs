@@ -15,15 +15,11 @@ pub struct Dish {
     pub name: String,
     pub allergens: String,
     pub url: String,
+    pub image: String,
 }
 
-pub struct DayMenu {
-    /// dd/mm/yyyy as the site writes it.
-    pub date: String,
-    pub unix: i64,
-    pub lunch: Vec<Dish>,
-    pub dinner: Vec<Dish>,
-}
+pub const LUNCH: u8 = 3;
+pub const DINNER: u8 = 5;
 
 fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = s.find(start)? + start.len();
@@ -53,46 +49,51 @@ pub fn parse_menu(html: &str) -> (Option<String>, Vec<Dish>) {
             name,
             allergens: allergens.join(", "),
             url: between(item, "href=\"", "\"").filter(|u| u.contains("/piatto/")).unwrap_or_default().to_owned(),
+            // The first image of an item is the dish photo; allergen icons come later.
+            image: between(item, "src=\"", "\"").filter(|u| u.contains("/images/piatti/")).unwrap_or_default().to_owned(),
         });
     }
     (day, dishes)
 }
 
-fn session_cookie(lang: &str) -> String {
-    // The menu language lives in the server session.
-    // The cookie comes with the redirect, so don't follow it.
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
-    match agent.get(&format!("{BASE}/change_language/{lang}")).call() {
-        Ok(r) => r.all("set-cookie").into_iter().filter_map(|c| c.split(';').next()).filter(|c| c.starts_with("markas_ci_session=") && c.len() > 20).last().unwrap_or_default().to_owned(),
-        Err(_) => String::new(),
-    }
+static LANG_COOKIE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Session cookie with the language set to English (the language lives in the server session).
+fn english_session() -> String {
+    let mut c = LANG_COOKIE.lock().unwrap();
+    c.get_or_insert_with(|| {
+        // The cookie comes with the redirect, so don't follow it.
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        match agent.get(&format!("{BASE}/change_language/en")).call() {
+            Ok(r) => r.all("set-cookie").into_iter().filter_map(|c| c.split(';').next()).filter(|c| c.starts_with("markas_ci_session=") && c.len() > 20).last().unwrap_or_default().to_owned(),
+            Err(_) => String::new(),
+        }
+    })
+    .clone()
 }
 
-fn get_html(url: &str, cookie: &str) -> Res<String> {
-    ureq::get(url).set("Cookie", cookie).call().map_err(err)?.into_string().map_err(err)
+/// One meal (LUNCH or DINNER) of one day; empty when nothing is published for that day.
+pub fn day(location: &str, meal: u8, date: &gtk::glib::DateTime) -> Res<Vec<Dish>> {
+    let want = date.format("%d/%m/%Y").map_err(err)?.to_string();
+    let html = ureq::get(&format!("{BASE}/menu/{}/0/{location}/{meal}", date.to_unix())).set("Cookie", &english_session()).call().map_err(err)?.into_string().map_err(err)?;
+    let (shown, dishes) = parse_menu(&html);
+    // The site falls back to another day when there is no menu for this one.
+    Ok(if shown.as_deref() == Some(want.as_str()) { dishes } else { Vec::new() })
 }
 
-/// Lunch and dinner for today and the following days (days without a menu are skipped).
-pub fn menus(location: &str, days: i64) -> Res<Vec<DayMenu>> {
-    let cookie = session_cookie("en");
-    let now = gtk::glib::DateTime::now_local().map_err(err)?;
-    let mut out = Vec::new();
-    for k in 0..days {
-        let d = now.add_days(k as i32).map_err(err)?;
-        let want = d.format("%d/%m/%Y").map_err(err)?.to_string();
-        let mut meals = Vec::new();
-        for meal in [3, 5] {
-            let (shown, dishes) = parse_menu(&get_html(&format!("{BASE}/menu/{}/0/{location}/{meal}", d.to_unix()), &cookie)?);
-            // The site falls back to another day when there is no menu for this one.
-            meals.push(if shown.as_deref() == Some(want.as_str()) { dishes } else { Vec::new() });
-        }
-        let dinner = meals.pop().unwrap_or_default();
-        let lunch = meals.pop().unwrap_or_default();
-        if !lunch.is_empty() || !dinner.is_empty() {
-            out.push(DayMenu { date: want, unix: d.to_unix(), lunch, dinner });
-        }
+/// Local copy of a dish photo (cached; photos don't change).
+pub fn image(url: &str) -> Res<std::path::PathBuf> {
+    let name = url.rsplit('/').next().unwrap_or("dish.jpg").replace(['\\', '\0'], "_");
+    let dir = gtk::glib::user_cache_dir().join("unibz-terminal").join("mensa");
+    let path = dir.join(if name.is_empty() || name.starts_with('.') { "dish.jpg" } else { &name });
+    if path.is_file() {
+        return Ok(path);
     }
-    Ok(out)
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let part = path.with_extension("part");
+    std::io::copy(&mut ureq::get(url).call().map_err(err)?.into_reader(), &mut std::fs::File::create(&part).map_err(err)?).map_err(err)?;
+    std::fs::rename(&part, &path).map_err(err)?;
+    Ok(path)
 }
 
 /// First money amount in a line: "12,40", "€ 3.10", "-1.50 €".
@@ -136,12 +137,10 @@ fn find_amount(lines: &[&str], keys: &[&str]) -> Option<f64> {
     None
 }
 
-/// (credit balance, meal price) from the reserved area's visible text, in any of the site's languages.
-pub fn parse_account(text: &str) -> (Option<f64>, Option<f64>) {
+/// Credit balance from the reserved area's visible text, in any of the site's languages.
+pub fn parse_balance(text: &str) -> Option<f64> {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let balance = find_amount(&lines, &["balance", "credit", "saldo", "credito", "guthaben", "borsellino", "wallet"]);
-    let price = find_amount(&lines, &["meal price", "price per meal", "tariff", "fascia", "prezzo pasto", "costo pasto", "preis"]);
-    (balance, price)
+    find_amount(&lines, &["balance", "credit", "saldo", "credito", "guthaben", "borsellino", "wallet"])
 }
 
 #[cfg(test)]
@@ -158,19 +157,19 @@ mod tests {
 
     #[test]
     fn account_text() {
-        let t = "Hello Elia\nYour credit\n€ 23,10\nTariff band 2: 3,50 €\nTop up";
-        assert_eq!(parse_account(t), (Some(23.10), Some(3.50)));
+        let t = "Hello\nYour credit\n€ 23,10\nTariff band 2: 3,50 €\nTop up";
+        assert_eq!(parse_balance(t), Some(23.10));
     }
 
     #[test]
     fn menu_html() {
         let h = r#"<div class="squared_day selected " data-day="20/11/2026"><a></a></div>
 <div data-filter=".dt_1, .dt_2" class="x">All</div><div data-filter=".dt_1" class="cbp-filter-item">First courses<div></div></div>
-<div data-id="1" data-price="0" class="pointer cbp-item dt_1 allergene_37"><a href="https://unibz.markas.info/piatto/1-x/3783/3/1"></a>
+<div data-id="1" data-price="0" class="pointer cbp-item dt_1 allergene_37"><a href="https://unibz.markas.info/piatto/1-x/3783/3/1"><img width="100%" src="https://unibz.markas.info/images/piatti/1-x.jpg"></a>
 <div class="cbp-l-grid-masonry-projects-title">Pasta &amp; pesto</div> <div class="cbp-l-grid-masonry-projects-desc">&nbsp; <img alt="Cereali: <strong>Grano</strong>"></div> <!-- x --></div>"#;
         let (day, dishes) = parse_menu(h);
         assert_eq!(day.as_deref(), Some("20/11/2026"));
-        assert_eq!(dishes, vec![Dish { category: "First courses".into(), name: "Pasta & pesto".into(), allergens: "Cereali: Grano".into(), url: "https://unibz.markas.info/piatto/1-x/3783/3/1".into() }]);
+        assert_eq!(dishes, vec![Dish { category: "First courses".into(), name: "Pasta & pesto".into(), allergens: "Cereali: Grano".into(), url: "https://unibz.markas.info/piatto/1-x/3783/3/1".into(), image: "https://unibz.markas.info/images/piatti/1-x.jpg".into() }]);
     }
 }
 
@@ -180,10 +179,11 @@ mod live {
     #[test]
     #[ignore]
     fn live_menu() {
-        let days = super::menus("3783", 6).unwrap();
-        for d in &days {
-            println!("{} lunch {} dinner {} e.g. {:?}", d.date, d.lunch.len(), d.dinner.len(), d.lunch.first());
+        let today = gtk::glib::DateTime::now_local().unwrap();
+        let dishes = super::day("3783", super::LUNCH, &today).unwrap();
+        println!("{} dishes, e.g. {:?}", dishes.len(), dishes.first());
+        if let Some(d) = dishes.iter().find(|d| !d.image.is_empty()) {
+            println!("image at {:?}", super::image(&d.image).unwrap());
         }
-        assert!(!days.is_empty());
     }
 }

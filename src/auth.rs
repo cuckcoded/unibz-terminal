@@ -29,9 +29,8 @@ pub struct Config {
     pub graph_redirect_uri: Option<String>,
     /// mySNS course code -> manual OLE/Teams assignment (replaces auto-matching).
     pub overrides: HashMap<String, Override>,
-    /// Mensa: menu id (see mensa::LOCATIONS) and what one meal costs you.
+    /// Mensa menu id (see mensa::LOCATIONS).
     pub mensa_location: Option<String>,
-    pub mensa_meal_price: Option<f64>,
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]

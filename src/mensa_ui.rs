@@ -1,6 +1,7 @@
 //! Mensa page: credit, meals left and the menu for the coming days.
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::Duration,
 };
@@ -10,7 +11,7 @@ use gtk::glib;
 use webkit6::prelude::*;
 
 use crate::auth::{self, Res};
-use crate::mensa::{self, AREA, BASE, DayMenu, Dish, SNS_LOGIN};
+use crate::mensa::{self, AREA, BASE, DINNER, Dish, LUNCH, SNS_LOGIN};
 use crate::ui::*;
 
 /// Visible text of the reserved area, signing in with SNS when needed. The window only shows
@@ -72,7 +73,7 @@ async fn account_text() -> Res<String> {
                         glib::timeout_future(Duration::from_millis(1500)).await;
                         let text = v.evaluate_javascript_future("document.body.innerText", None, None).await.map(|j| j.to_str().to_string());
                         match text {
-                            Ok(t) if mensa::parse_account(&t).0.is_some() || attempt == 5 => return finish(Ok(t)),
+                            Ok(t) if mensa::parse_balance(&t).is_some() || attempt == 5 => return finish(Ok(t)),
                             Ok(_) => {}
                             Err(e) => return finish(Err(e.to_string())),
                         }
@@ -95,6 +96,62 @@ async fn account_text() -> Res<String> {
     }
 }
 
+#[derive(Default)]
+struct CreditCache {
+    value: Option<Res<f64>>,
+    loading: bool,
+    waiters: Vec<futures_channel::oneshot::Sender<Res<f64>>>,
+}
+
+thread_local! {
+    static CREDIT: RefCell<CreditCache> = RefCell::default();
+}
+
+/// Mensa credit, fetched once per run and shared by Home and the Mensa page; `force` re-reads it.
+pub async fn credit(force: bool) -> Res<f64> {
+    enum Next {
+        Done(Res<f64>),
+        Wait(futures_channel::oneshot::Receiver<Res<f64>>),
+        Fetch,
+    }
+    let next = CREDIT.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.loading {
+            let (tx, rx) = futures_channel::oneshot::channel();
+            c.waiters.push(tx);
+            return Next::Wait(rx);
+        }
+        match (&c.value, force) {
+            (Some(v), false) => Next::Done(v.clone()),
+            _ => {
+                c.loading = true;
+                Next::Fetch
+            }
+        }
+    });
+    match next {
+        Next::Done(v) => v,
+        Next::Wait(rx) => rx.await.unwrap_or(Err("cancelled".into())),
+        Next::Fetch => {
+            let r = account_text().await.and_then(|t| mensa::parse_balance(&t).ok_or("could not find the credit on the reserved-area page".into()));
+            let waiters = CREDIT.with(|c| {
+                let mut c = c.borrow_mut();
+                c.loading = false;
+                c.value = Some(r.clone());
+                std::mem::take(&mut c.waiters)
+            });
+            for w in waiters {
+                let _ = w.send(r.clone());
+            }
+            r
+        }
+    }
+}
+
+pub fn euros(v: f64) -> String {
+    format!("€ {v:.2}")
+}
+
 fn open_reserved_area() {
     let view = auth::web_view();
     let win = gtk::Window::builder().title("Mensa reserved area").default_width(900).default_height(800).child(&view).build();
@@ -103,178 +160,193 @@ fn open_reserved_area() {
     win.present();
 }
 
-fn big_label() -> gtk::Label {
-    gtk::Label::builder().label("…").css_classes(["title-3"]).build()
-}
-
-fn day_title(d: &DayMenu) -> String {
-    let date = glib::DateTime::from_unix_local(d.unix).ok().and_then(|t| t.format("%A %d %B").ok()).map_or(d.date.clone(), |s| s.to_string());
-    let day = |offset| glib::DateTime::now_local().and_then(|t| t.add_days(offset)).ok().and_then(|t| t.format("%d/%m/%Y").ok()).map(|s| s.to_string());
-    if day(0).as_deref() == Some(d.date.as_str()) {
-        format!("Today · {date}")
-    } else if day(1).as_deref() == Some(d.date.as_str()) {
-        format!("Tomorrow · {date}")
-    } else {
-        date
-    }
-}
-
-fn meal_row(title: &str, dishes: &[Dish], expanded: bool) -> adw::ExpanderRow {
-    let ex = adw::ExpanderRow::builder().title(title).subtitle(format!("{} dishes", dishes.len())).expanded(expanded).build();
-    let mut by_cat: Vec<(&str, Vec<&Dish>)> = Vec::new();
-    for d in dishes {
-        match by_cat.iter_mut().find(|(c, _)| *c == d.category) {
-            Some((_, v)) => v.push(d),
-            None => by_cat.push((&d.category, vec![d])),
-        }
-    }
-    for (cat, ds) in by_cat {
-        for d in ds {
-            let sub = [cat.to_owned(), d.allergens.clone()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
-            let r = row(&d.name, &sub);
-            r.set_subtitle_lines(2);
-            if !d.url.is_empty() {
-                r.set_activatable(true);
-                r.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
-                let url = d.url.clone();
-                r.connect_activated(move |r| open_uri(r, &url));
-            }
-            ex.add_row(&r);
-        }
-    }
-    ex
-}
-
-pub fn page() -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    let cfg = auth::config();
-
-    // Credit.
-    let credit = group("Credit");
-    let (balance_label, meals_label) = (big_label(), big_label());
-    let balance_row = row("Balance", "From the mensa reserved area");
-    balance_row.add_suffix(&balance_label);
-    let price = adw::SpinRow::builder().title("Price per meal (€)").digits(2).adjustment(&gtk::Adjustment::new(cfg.mensa_meal_price.unwrap_or(0.0), 0.0, 30.0, 0.05, 0.5, 0.0)).build();
-    let meals_row = row("Meals you can afford", "Balance ÷ price per meal");
-    meals_row.add_suffix(&meals_label);
-    credit.add(&balance_row);
-    credit.add(&price);
-    credit.add(&meals_row);
-
-    let balance: Rc<Cell<Option<f64>>> = Rc::default();
-    let update_meals: Rc<dyn Fn()> = Rc::new({
-        let (balance, price, meals_label) = (balance.clone(), price.clone(), meals_label.clone());
-        move || {
-            meals_label.set_label(&match (balance.get(), price.value()) {
-                (Some(b), p) if p > 0.0 => ((b / p).floor().max(0.0) as i64).to_string(),
-                (Some(_), _) => "set a price".into(),
-                (None, _) => "–".into(),
-            })
-        }
-    });
-    price.connect_value_notify({
-        let update = update_meals.clone();
-        move |p| {
-            let mut cfg = auth::config();
-            cfg.mensa_meal_price = Some(p.value());
-            if let Err(e) = auth::save_config(&cfg) {
-                eprintln!("saving config: {e}");
-            }
-            update();
-        }
-    });
-
+fn credit_group() -> adw::PreferencesGroup {
+    let g = group("Credit");
+    let label = gtk::Label::builder().label("…").css_classes(["title-3"]).build();
+    let r = row("Balance", "From the mensa reserved area");
+    r.add_suffix(&label);
+    g.add(&r);
     let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Refresh credit").css_classes(["flat"]).valign(gtk::Align::Center).build();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.append(&button("Reserved area", |_| open_reserved_area()));
     header.append(&refresh);
-    credit.set_header_suffix(Some(&header));
-    let load_credit: Rc<dyn Fn()> = Rc::new({
-        let (credit, balance, balance_label, price, update, refresh) = (credit.clone(), balance.clone(), balance_label.clone(), price.clone(), update_meals.clone(), refresh.clone());
-        move || {
-            let (credit, balance, balance_label, price, update, refresh) = (credit.clone(), balance.clone(), balance_label.clone(), price.clone(), update.clone(), refresh.clone());
+    g.set_header_suffix(Some(&header));
+    let load = Rc::new({
+        let (g, label, refresh) = (g.clone(), label.clone(), refresh.clone());
+        move |force: bool| {
+            let (g, label, refresh) = (g.clone(), label.clone(), refresh.clone());
             refresh.set_sensitive(false);
-            balance_label.set_label("…");
-            credit.set_description(Some("Signing in to the mensa…"));
+            label.set_label("…");
             glib::spawn_future_local(async move {
-                match account_text().await {
-                    Ok(text) => {
-                        let (b, p) = mensa::parse_account(&text);
-                        balance.set(b);
-                        balance_label.set_label(&b.map_or("?".into(), |b| format!("€ {b:.2}")));
-                        // Use the site's meal price until the user sets one.
-                        if let (Some(p), true) = (p, auth::config().mensa_meal_price.is_none()) {
-                            price.set_value(p);
-                        }
-                        credit.set_description(if b.is_some() { None } else { Some("Could not find the credit on the reserved-area page. Use “Reserved area” to check it there.") });
+                match credit(force).await {
+                    Ok(v) => {
+                        label.set_label(&euros(v));
+                        g.set_description(None);
                     }
                     Err(e) => {
-                        balance_label.set_label("?");
-                        credit.set_description(Some(&format!("Could not read the credit: {e}")));
+                        label.set_label("?");
+                        g.set_description(Some(&format!("Could not read the credit: {e}. Use “Reserved area” to check it there.")));
                     }
                 }
-                update();
                 refresh.set_sensitive(true);
             });
         }
     });
     refresh.connect_clicked({
-        let load = load_credit.clone();
-        move |_| load()
+        let load = load.clone();
+        move |_| load(true)
     });
-    page.add(&credit);
-    load_credit();
+    load(false);
+    g
+}
 
-    // Menu.
-    let location = adw::ComboRow::builder().title("Mensa").model(&gtk::StringList::new(&mensa::LOCATIONS.map(|l| l.1))).build();
-    let current = cfg.mensa_location.clone().unwrap_or(mensa::LOCATIONS[0].0.into());
-    location.set_selected(mensa::LOCATIONS.iter().position(|l| l.0 == current).unwrap_or(0) as u32);
-    let settings = group("Menu");
-    settings.set_header_suffix(Some(&link_button("Website", format!("{BASE}/menu"))));
-    settings.add(&location);
-    page.add(&settings);
+fn day_label(offset: i32, date: &glib::DateTime) -> String {
+    let d = date.format("%A %d %B").map(|s| s.to_string()).unwrap_or_default();
+    match offset {
+        0 => format!("Today · {d}"),
+        1 => format!("Tomorrow · {d}"),
+        -1 => format!("Yesterday · {d}"),
+        _ => d,
+    }
+}
 
-    let days: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::default();
-    let load_menu: Rc<dyn Fn()> = Rc::new({
-        let (page, location, days) = (page.clone(), location.clone(), days.clone());
-        move || {
-            for g in days.borrow_mut().drain(..) {
-                page.remove(&g);
+fn dish_card(d: &Dish) -> gtk::Box {
+    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["card"]).overflow(gtk::Overflow::Hidden).build();
+    let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(130).can_shrink(true).build();
+    card.append(&pic);
+    if !d.image.is_empty() {
+        let (url, pic2) = (d.image.clone(), pic.clone());
+        spawn(move || mensa::image(&url), move |r| {
+            if let Ok(path) = r {
+                pic2.set_filename(Some(path));
             }
-            let id = mensa::LOCATIONS[location.selected() as usize % mensa::LOCATIONS.len()].0.to_owned();
-            let g = group("");
-            page.add(&g);
-            days.borrow_mut().push(g.clone());
-            let (page, days) = (page.clone(), days.clone());
-            fill(&g, move || mensa::menus(&id, 7), move |g, menus| {
-                if menus.is_empty() {
-                    g.add(&row("No menu published for the coming days", ""));
+        });
+    }
+    let name = gtk::Label::builder().label(&d.name).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).xalign(0.0).margin_top(8).margin_bottom(10).margin_start(10).margin_end(10).build();
+    card.append(&name);
+    card.set_tooltip_text(Some(&if d.allergens.is_empty() { d.name.clone() } else { format!("{}\n\nAllergens: {}", d.name, d.allergens) }));
+    if !d.url.is_empty() {
+        let click = gtk::GestureClick::new();
+        let url = d.url.clone();
+        click.connect_released(move |g, _, _, _| {
+            if let Some(w) = g.widget() {
+                open_uri(&w, &url);
+            }
+        });
+        card.add_controller(click);
+        card.set_cursor_from_name(Some("pointer"));
+    }
+    card
+}
+
+/// One column per dish type (first courses, second courses, sides, …), in the site's order.
+fn columns(dishes: &[Dish]) -> gtk::Widget {
+    if dishes.is_empty() {
+        return adw::StatusPage::builder().icon_name("emoji-food-symbolic").title("No menu").description("Nothing is published for this meal.").build().upcast();
+    }
+    let mut cats: Vec<(&str, Vec<&Dish>)> = Vec::new();
+    for d in dishes {
+        match cats.iter_mut().find(|(c, _)| *c == d.category) {
+            Some((_, v)) => v.push(d),
+            None => cats.push((&d.category, vec![d])),
+        }
+    }
+    let cols = gtk::Box::builder().spacing(18).homogeneous(true).build();
+    for (cat, ds) in cats {
+        let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).width_request(180).build();
+        col.append(&gtk::Label::builder().label(if cat.is_empty() { "Other" } else { cat }).css_classes(["heading"]).xalign(0.0).build());
+        for d in ds {
+            col.append(&dish_card(d));
+        }
+        cols.append(&col);
+    }
+    cols.upcast()
+}
+
+pub fn page() -> gtk::Widget {
+    let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).margin_top(18).margin_bottom(18).margin_start(18).margin_end(18).build();
+    outer.append(&adw::Clamp::builder().maximum_size(800).child(&credit_group()).build());
+
+    // Day navigation, meal and location.
+    let bar = gtk::Box::builder().spacing(6).build();
+    let prev = gtk::Button::builder().icon_name("go-previous-symbolic").tooltip_text("Previous day").build();
+    let today = gtk::Button::builder().label("Today").build();
+    let next = gtk::Button::builder().icon_name("go-next-symbolic").tooltip_text("Next day").build();
+    let nav = gtk::Box::builder().css_classes(["linked"]).build();
+    nav.append(&prev);
+    nav.append(&today);
+    nav.append(&next);
+    let title = gtk::Label::builder().css_classes(["title-3"]).hexpand(true).xalign(0.0).margin_start(12).build();
+    let meal = gtk::DropDown::from_strings(&["Lunch", "Dinner"]);
+    // After lunch time, dinner is the next meal.
+    meal.set_selected(glib::DateTime::now_local().map(|d| (d.hour() >= 15) as u32).unwrap_or(0));
+    let location = gtk::DropDown::from_strings(&mensa::LOCATIONS.map(|l| l.1));
+    let current = auth::config().mensa_location.unwrap_or(mensa::LOCATIONS[0].0.into());
+    location.set_selected(mensa::LOCATIONS.iter().position(|l| l.0 == current).unwrap_or(0) as u32);
+    bar.append(&nav);
+    bar.append(&title);
+    bar.append(&meal);
+    bar.append(&location);
+    outer.append(&bar);
+
+    let holder = adw::Bin::builder().vexpand(true).build();
+    outer.append(&holder);
+
+    let offset = Rc::new(Cell::new(0i32));
+    let generation = Rc::new(Cell::new(0u32));
+    let cache: Rc<RefCell<HashMap<(String, u8, String), Vec<Dish>>>> = Rc::default();
+    let reload: Rc<dyn Fn()> = Rc::new({
+        let (title, meal, location, holder, offset) = (title.clone(), meal.clone(), location.clone(), holder.clone(), offset.clone());
+        move || {
+            let Ok(date) = glib::DateTime::now_local().and_then(|d| d.add_days(offset.get())) else { return };
+            title.set_label(&day_label(offset.get(), &date));
+            let loc = mensa::LOCATIONS[location.selected() as usize % mensa::LOCATIONS.len()].0.to_owned();
+            let m = if meal.selected() == 1 { DINNER } else { LUNCH };
+            let key = (loc.clone(), m, date.format("%F").map(|s| s.to_string()).unwrap_or_default());
+            if let Some(d) = cache.borrow().get(&key) {
+                holder.set_child(Some(&columns(d)));
+                return;
+            }
+            holder.set_child(Some(&adw::Spinner::builder().width_request(32).height_request(32).halign(gtk::Align::Center).valign(gtk::Align::Start).build()));
+            // Ignore answers for days the user has already clicked past.
+            generation.set(generation.get() + 1);
+            let (gen_now, generation, holder, cache) = (generation.get(), generation.clone(), holder.clone(), cache.clone());
+            spawn(move || mensa::day(&loc, m, &date), move |r| {
+                if generation.get() != gen_now {
+                    return;
                 }
-                for (i, d) in menus.iter().enumerate() {
-                    let dg = group(&day_title(d));
-                    if !d.lunch.is_empty() {
-                        dg.add(&meal_row("Lunch", &d.lunch, i == 0));
+                match r {
+                    Ok(d) => {
+                        holder.set_child(Some(&columns(&d)));
+                        cache.borrow_mut().insert(key, d);
                     }
-                    if !d.dinner.is_empty() {
-                        dg.add(&meal_row("Dinner", &d.dinner, false));
-                    }
-                    page.add(&dg);
-                    days.borrow_mut().push(dg);
+                    Err(e) => holder.set_child(Some(&adw::StatusPage::builder().title("Could not load the menu").description(esc(&e)).build())),
                 }
             });
         }
     });
+    for (b, delta) in [(&prev, -1), (&today, 0), (&next, 1)] {
+        let (offset, reload) = (offset.clone(), reload.clone());
+        b.connect_clicked(move |_| {
+            offset.set(if delta == 0 { 0 } else { offset.get() + delta });
+            reload();
+        });
+    }
+    meal.connect_selected_notify({
+        let reload = reload.clone();
+        move |_| reload()
+    });
     location.connect_selected_notify({
-        let load = load_menu.clone();
+        let reload = reload.clone();
         move |l| {
             let mut cfg = auth::config();
             cfg.mensa_location = Some(mensa::LOCATIONS[l.selected() as usize % mensa::LOCATIONS.len()].0.into());
             if let Err(e) = auth::save_config(&cfg) {
                 eprintln!("saving config: {e}");
             }
-            load();
+            reload();
         }
     });
-    load_menu();
-    page
+    reload();
+    gtk::ScrolledWindow::builder().child(&outer).build().upcast()
 }
