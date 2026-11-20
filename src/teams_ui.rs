@@ -44,7 +44,8 @@ fn with<T: Send + 'static>(t: &Rc<Team>, job: impl FnOnce(&Team) -> Res<T> + Sen
     move || job(&copy)
 }
 
-pub fn tab(t: Rc<Team>) -> adw::NavigationView {
+/// `actions` go into the team page header (e.g. the assign menu).
+pub fn tab(t: Rc<Team>, actions: &[gtk::Widget]) -> adw::NavigationView {
     let nav = adw::NavigationView::new();
     let page = adw::PreferencesPage::new();
 
@@ -93,7 +94,7 @@ pub fn tab(t: Rc<Team>) -> adw::NavigationView {
     );
     page.add(&sp);
 
-    nav.push(&subpage(&t.name, &page, &[]));
+    nav.push(&subpage(&t.name, &page, actions));
     nav
 }
 

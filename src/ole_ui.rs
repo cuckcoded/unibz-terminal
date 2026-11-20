@@ -32,7 +32,8 @@ impl Ole {
     }
 }
 
-pub fn tab(o: Rc<Ole>) -> adw::NavigationView {
+/// `actions` go into the course page header (e.g. the assign menu).
+pub fn tab(o: Rc<Ole>, actions: &[gtk::Widget]) -> adw::NavigationView {
     let nav = adw::NavigationView::new();
     let page = adw::PreferencesPage::new();
     let g = group("Course");
@@ -115,7 +116,7 @@ pub fn tab(o: Rc<Ole>) -> adw::NavigationView {
             }
         },
     );
-    nav.push(&subpage(&o.name, &page, &[]));
+    nav.push(&subpage(&o.name, &page, actions));
     nav
 }
 

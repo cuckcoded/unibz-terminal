@@ -214,13 +214,14 @@ fn show(ui: &Rc<Ui>, key: &str) {
         }
         "o" => {
             let name = state.data.borrow().ole.iter().find(|o| o.0.to_string() == id).map(|o| o.1.clone()).unwrap_or_default();
-            let assign = assign_to_course_button(ui, &state, Link::Ole(id.parse().unwrap_or_default(), name.clone()));
-            (name.clone(), tabs(vec![("OLE".into(), "accessories-dictionary-symbolic", ole_tab(&state, id.parse().unwrap_or_default(), &name, &name))], &[assign]))
+            let id = id.parse().unwrap_or_default();
+            let menu = link_menu(ui, &state, Link::Ole(id, name.clone()), None);
+            (name.clone(), tabs(vec![("OLE".into(), "accessories-dictionary-symbolic", ole_tab(&state, id, &name, &name, menu))], &[]))
         }
         "t" => {
             let Some(t) = state.data.borrow().teams.iter().find(|t| t.0 == id).cloned() else { return };
-            let assign = assign_to_course_button(ui, &state, Link::Team(t.clone()));
-            (t.1.clone(), tabs(vec![("Teams".into(), "system-users-symbolic", team_tab(&state, &t, &t.1))], &[assign]))
+            let menu = link_menu(ui, &state, Link::Team(t.clone()), None);
+            (t.1.clone(), tabs(vec![("Teams".into(), "system-users-symbolic", team_tab(&state, &t, &t.1, menu))], &[]))
         }
         _ => return,
     };
@@ -239,7 +240,7 @@ fn tabs(pages: Vec<(String, &str, gtk::Widget)>, extra: &[gtk::Widget]) -> adw::
     toolbar(&stack, Some(switcher.upcast_ref()), extra)
 }
 
-fn ole_tab(state: &State, id: i64, name: &str, folder: &str) -> gtk::Widget {
+fn ole_tab(state: &State, id: i64, name: &str, folder: &str, menu: gtk::Widget) -> gtk::Widget {
     match &state.access.moodle {
         Ok(token) => ole_ui::tab(Rc::new(ole_ui::Ole {
             token: token.clone(),
@@ -248,15 +249,15 @@ fn ole_tab(state: &State, id: i64, name: &str, folder: &str) -> gtk::Widget {
             course: id,
             name: name.into(),
             folder: folder.into(),
-        }))
+        }), &[menu])
         .upcast(),
         Err(e) => status("OLE unavailable", e, false).upcast(),
     }
 }
 
-fn team_tab(state: &State, t: &(String, String, String), folder: &str) -> gtk::Widget {
+fn team_tab(state: &State, t: &(String, String, String), folder: &str, menu: gtk::Widget) -> gtk::Widget {
     match &state.access.graph {
-        Ok(token) => teams_ui::tab(Rc::new(teams_ui::Team { token: token.clone(), id: t.0.clone(), name: t.1.clone(), url: t.2.clone(), folder: folder.into() })).upcast(),
+        Ok(token) => teams_ui::tab(Rc::new(teams_ui::Team { token: token.clone(), id: t.0.clone(), name: t.1.clone(), url: t.2.clone(), folder: folder.into() }), &[menu]).upcast(),
         Err(e) => status("Teams unavailable", e, false).upcast(),
     }
 }
@@ -265,11 +266,13 @@ fn course_page(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::ToolbarView {
     let mut pages = vec![("mySNS".to_string(), "x-office-document-symbolic", overview(ui, state, c).upcast())];
     for (id, name) in &c.moodle {
         let title = if c.moodle.len() > 1 { format!("OLE: {name}") } else { "OLE".into() };
-        pages.push((title, "accessories-dictionary-symbolic", ole_tab(state, *id, name, &c.name)));
+        let menu = link_menu(ui, state, Link::Ole(*id, name.clone()), Some(c.id));
+        pages.push((title, "accessories-dictionary-symbolic", ole_tab(state, *id, name, &c.name, menu)));
     }
     for t in &c.teams {
         let title = if c.teams.len() > 1 { format!("Teams: {}", t.1) } else { "Teams".into() };
-        pages.push((title, "system-users-symbolic", team_tab(state, t, &c.name)));
+        let menu = link_menu(ui, state, Link::Team(t.clone()), Some(c.id));
+        pages.push((title, "system-users-symbolic", team_tab(state, t, &c.name, menu)));
     }
     tabs(pages, &[])
 }
@@ -290,9 +293,17 @@ fn save_link(ui: &Rc<Ui>, state: &State, course_id: i64, link: Link, add: bool, 
     let mut data = state.data.borrow_mut();
     let Some(c) = data.courses.iter_mut().find(|c| c.id == course_id) else { return };
     match (link, add) {
-        (Link::Ole(id, name), true) => c.moodle.push((id, name)),
+        (Link::Ole(id, name), true) => {
+            if !c.moodle.iter().any(|m| m.0 == id) {
+                c.moodle.push((id, name))
+            }
+        }
         (Link::Ole(id, _), false) => c.moodle.retain(|m| m.0 != id),
-        (Link::Team(t), true) => c.teams.push(t),
+        (Link::Team(t), true) => {
+            if !c.teams.iter().any(|x| x.0 == t.0) {
+                c.teams.push(t)
+            }
+        }
         (Link::Team(t), false) => c.teams.retain(|x| x.0 != t.0),
     }
     let mut cfg = auth::config();
@@ -339,22 +350,55 @@ fn choose(parent: &impl IsA<gtk::Widget>, title: &str, options: Vec<(String, Str
     dialog.present(Some(parent));
 }
 
-fn assign_to_course_button(ui: &Rc<Ui>, state: &Rc<State>, link: Link) -> gtk::Widget {
-    let (ui, state) = (ui.clone(), state.clone());
-    button("Assign to course…", move |b| {
-        let options = state
-            .data
-            .borrow()
-            .courses
-            .iter()
-            .map(|c| {
-                let (ui, state, link, id) = (ui.clone(), state.clone(), link.clone(), c.id);
-                (c.name.clone(), format!("{} · year {}", c.status, c.degree_year), Box::new(move || change_link(&ui, &state, id, link.clone(), true)) as Box<dyn Fn()>)
-            })
-            .collect();
-        choose(b, "Assign to mySNS course", options);
-    })
-    .upcast()
+/// "Assign" menu for an OLE course or team; `current` is the mySNS course it is shown under.
+fn link_menu(ui: &Rc<Ui>, state: &Rc<State>, link: Link, current: Option<i64>) -> gtk::Widget {
+    let menu = gtk::MenuButton::builder().label("Assign").css_classes(["flat"]).valign(gtk::Align::Center).tooltip_text("Assign to mySNS courses").build();
+    let popover = gtk::Popover::new();
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Add,
+        Move,
+        Remove,
+    }
+    let mut entries = vec![("Assign to another course…", Mode::Add)];
+    if current.is_some() {
+        entries.push(("Move to another course…", Mode::Move));
+        entries.push(("Unlink from this course", Mode::Remove));
+    }
+    for (label, mode) in entries {
+        let b = gtk::Button::builder().label(label).css_classes(["flat"]).build();
+        b.child().and_downcast::<gtk::Label>().inspect(|l| l.set_xalign(0.0));
+        let (ui, state, link, popover2, menu2) = (ui.clone(), state.clone(), link.clone(), popover.clone(), menu.clone());
+        b.connect_clicked(move |_| {
+            popover2.popdown();
+            if let (Mode::Remove, Some(cur)) = (mode, current) {
+                return change_link(&ui, &state, cur, link.clone(), false);
+            }
+            let options = state
+                .data
+                .borrow()
+                .courses
+                .iter()
+                .filter(|c| Some(c.id) != current)
+                .map(|c| {
+                    let (ui, state, link, target) = (ui.clone(), state.clone(), link.clone(), c.id);
+                    let act = move || {
+                        if let (Mode::Move, Some(cur)) = (mode, current) {
+                            change_link(&ui, &state, cur, link.clone(), false);
+                        }
+                        change_link(&ui, &state, target, link.clone(), true);
+                    };
+                    (c.name.clone(), format!("{} · year {}", c.status, c.degree_year), Box::new(act) as Box<dyn Fn()>)
+                })
+                .collect();
+            choose(&menu2, if matches!(mode, Mode::Move) { "Move to mySNS course" } else { "Assign to mySNS course" }, options);
+        });
+        vbox.append(&b);
+    }
+    popover.set_child(Some(&vbox));
+    menu.set_popover(Some(&popover));
+    menu.upcast()
 }
 
 /// After enrolling/joining: it is no longer a suggestion anywhere, and becomes a linked tab here.
