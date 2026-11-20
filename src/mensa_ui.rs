@@ -23,64 +23,79 @@ async fn login_and_read() -> Res<String> {
     auth::set_parent(&win);
     let (tx, rx) = futures_channel::oneshot::channel::<Res<String>>();
     let tx = Rc::new(RefCell::new(Some(tx)));
+    // Pages visited (host and path only), so a failure says where it got stuck.
+    let trail: Rc<RefCell<Vec<String>>> = Rc::default();
     let send = {
-        let tx = tx.clone();
+        let (tx, trail) = (tx.clone(), trail.clone());
         Rc::new(move |r: Res<String>| {
+            let r = r.map_err(|e| format!("{e} (pages: {})", trail.borrow().join(" → ")));
+            if let Err(e) = &r {
+                eprintln!("mensa sign-in: {e}");
+            }
             if let Some(tx) = tx.borrow_mut().take() {
                 let _ = tx.send(r);
             }
         })
     };
     // Each step is decided from where we landed, so unexpected redirects don't derail it.
-    let (tried_login, landings) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)));
-    let loads = Rc::new(Cell::new(0u32));
+    let (tried_login, landings, loads) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)), Rc::new(Cell::new(0u32)));
     let weak_win = win.downgrade();
-    view.connect_load_changed(move |v, ev| {
-        if ev == webkit6::LoadEvent::Started {
-            loads.set(loads.get() + 1);
-        }
-        if ev != webkit6::LoadEvent::Finished {
-            return;
-        }
-        let uri = v.uri().map(|u| u.to_string()).unwrap_or_default();
-        if uri.starts_with(AREA) {
-            let (v, send) = (v.clone(), send.clone());
-            glib::spawn_future_local(async move {
-                for attempt in 0..3 {
-                    match v.evaluate_javascript_future("document.body.innerText", None, None).await {
-                        Ok(j) => {
-                            let t = j.to_str().to_string();
-                            if mensa::parse_balance(&t).is_some() || attempt == 2 {
-                                return send(Ok(t));
+    view.connect_load_changed({
+        let trail = trail.clone();
+        move |v, ev| {
+            if ev == webkit6::LoadEvent::Started {
+                loads.set(loads.get() + 1);
+            }
+            if ev != webkit6::LoadEvent::Finished {
+                return;
+            }
+            let uri = v.uri().map(|u| u.to_string()).unwrap_or_default();
+            let path = uri.split(['?', '#']).next().unwrap_or("").trim_start_matches("https://").to_owned();
+            trail.borrow_mut().push(path.clone());
+            let login_page = ["/auth", "/auth/", "/auth/chooseMethod", "/auth/basic"].iter().any(|p| path == format!("unibz.markas.info{p}"));
+            if uri.starts_with(AREA) {
+                let (v, send) = (v.clone(), send.clone());
+                glib::spawn_future_local(async move {
+                    for attempt in 0..3 {
+                        // The served HTML, not innerText: an off-screen page may have no layout.
+                        match v.evaluate_javascript_future("document.documentElement.outerHTML", None, None).await {
+                            Ok(j) => {
+                                let t = mensa::html_text(&j.to_str());
+                                if mensa::parse_balance(&t).is_some() {
+                                    return send(Ok(t));
+                                }
+                                if attempt == 2 {
+                                    return send(Err("the reserved area opened but shows no balance".into()));
+                                }
                             }
+                            Err(e) => return send(Err(e.to_string())),
                         }
-                        Err(e) => return send(Err(e.to_string())),
+                        glib::timeout_future(Duration::from_millis(800)).await;
                     }
-                    glib::timeout_future(Duration::from_millis(800)).await;
+                });
+            } else if login_page {
+                if tried_login.replace(true) {
+                    send(Err("the mensa did not accept the SNS sign-in".into()));
+                } else {
+                    v.load_uri(SNS_LOGIN);
                 }
-            });
-        } else if uri.starts_with(&format!("{BASE}/auth")) {
-            if tried_login.replace(true) {
-                send(Err("the mensa did not accept the SNS sign-in".into()));
-            } else {
-                v.load_uri(SNS_LOGIN);
-            }
-        } else if uri.starts_with(BASE) && !uri.contains("/api/") {
-            // Signed in and dropped somewhere else on the site.
-            landings.set(landings.get() + 1);
-            if landings.get() > 3 {
-                send(Err("could not reach the reserved area".into()));
-            } else {
-                v.load_uri(AREA);
-            }
-        } else {
-            // On Microsoft: if nothing moves on for a few seconds, it needs the user.
-            let (n, loads, weak_win) = (loads.get(), loads.clone(), weak_win.clone());
-            glib::timeout_add_local_once(Duration::from_secs(4), move || {
-                if let Some(w) = weak_win.upgrade().filter(|_| loads.get() == n) {
-                    w.present();
+            } else if uri.starts_with(BASE) && !uri.contains("/api/") && !uri.contains("/auth") {
+                // Signed in and dropped somewhere else on the site.
+                landings.set(landings.get() + 1);
+                if landings.get() > 3 {
+                    send(Err("could not reach the reserved area".into()));
+                } else {
+                    v.load_uri(AREA);
                 }
-            });
+            } else {
+                // Microsoft or an intermediate mensa step: if nothing moves on for a few seconds, it needs the user.
+                let (n, loads, weak_win) = (loads.get(), loads.clone(), weak_win.clone());
+                glib::timeout_add_local_once(Duration::from_secs(4), move || {
+                    if let Some(w) = weak_win.upgrade().filter(|_| loads.get() == n) {
+                        w.present();
+                    }
+                });
+            }
         }
     });
     win.connect_close_request(move |_| {
@@ -90,10 +105,11 @@ async fn login_and_read() -> Res<String> {
     view.load_uri(AREA);
     let r = glib::future_with_timeout(Duration::from_secs(180), rx).await;
     win.close();
+    let pages = trail.borrow().join(" → ");
     match r {
         Ok(Ok(r)) => r,
-        Ok(Err(_)) => Err("mensa sign-in window closed".into()),
-        Err(_) => Err("mensa sign-in timed out".into()),
+        Ok(Err(_)) => Err(format!("mensa sign-in window closed (pages: {pages})")),
+        Err(_) => Err(format!("mensa sign-in timed out (pages: {pages})")),
     }
 }
 
@@ -110,7 +126,7 @@ async fn fetch_credit() -> Res<f64> {
     if let Some(b) = balance_with(auth::stored("mensa").unwrap_or_default()).await? {
         return Ok(b);
     }
-    let text = login_and_read().await?;
+    let text = login_and_read().await.inspect_err(|e| eprintln!("mensa credit: {e}"))?;
     let cookie = auth::cookie_header(AREA).await;
     auth::store("mensa", (!cookie.is_empty()).then_some(cookie));
     mensa::parse_balance(&text).ok_or_else(|| "could not find the balance on the reserved-area page".into())
