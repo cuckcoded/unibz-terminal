@@ -3,7 +3,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use webkit6::prelude::*;
 
-use crate::api::{self, Item};
+use crate::api::{self, Dl, Item};
 use crate::auth::Res;
 
 pub fn esc(x: &str) -> String {
@@ -69,10 +69,11 @@ pub fn fill<T: Send + 'static>(g: &adw::PreferencesGroup, job: impl FnOnce() -> 
     });
 }
 
-pub fn download_and_open(w: &impl IsA<gtk::Widget>, url: String, folder: String, name: String, on_done: impl FnOnce(Res<()>) + 'static) {
+/// Opens the local copy of a file, downloading it first if missing or outdated.
+pub fn download_and_open(w: &impl IsA<gtk::Widget>, dl: Dl, folder: String, on_done: impl FnOnce(Res<()>) + 'static) {
     let win = window_of(w);
     spawn(
-        move || api::download(&url, &folder, &name),
+        move || api::fetch_file(&folder, &dl),
         move |r| match r {
             Ok(path) => {
                 gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
@@ -83,16 +84,30 @@ pub fn download_and_open(w: &impl IsA<gtk::Widget>, url: String, folder: String,
     );
 }
 
+fn file_icon(cached: bool) -> (&'static str, &'static str) {
+    if cached { ("document-open-symbolic", "Saved locally") } else { ("folder-download-symbolic", "Download") }
+}
+
 pub fn item_row(it: &Item, folder: &str) -> adw::ActionRow {
     let r = row(&it.title, &it.subtitle);
     r.set_activatable(true);
-    r.add_suffix(&gtk::Image::from_icon_name(if it.download.is_some() { "folder-download-symbolic" } else { "adw-external-link-symbolic" }));
+    let (icon_name, tip) = match &it.download {
+        Some(dl) => file_icon(api::is_cached(folder, dl)),
+        None => ("adw-external-link-symbolic", "Open in browser"),
+    };
+    let icon = gtk::Image::builder().icon_name(icon_name).tooltip_text(tip).build();
+    r.add_suffix(&icon);
     let (it, folder) = (it.clone(), folder.to_owned());
     r.connect_activated(move |r| match it.download.clone() {
-        Some((url, name)) => {
-            let (r2, sub) = (r.clone(), it.subtitle.clone());
-            r.set_subtitle("Downloading…");
-            download_and_open(r, url, folder.clone(), name, move |res| {
+        Some(dl) => {
+            let (r2, sub, icon) = (r.clone(), it.subtitle.clone(), icon.clone());
+            r.set_subtitle("Opening…");
+            download_and_open(r, dl, folder.clone(), move |res| {
+                if res.is_ok() {
+                    let (name, tip) = file_icon(true);
+                    icon.set_icon_name(Some(name));
+                    icon.set_tooltip_text(Some(tip));
+                }
                 r2.set_subtitle(&esc(&match res {
                     Ok(()) => sub,
                     Err(e) => format!("Download failed: {e}"),
@@ -192,7 +207,10 @@ pub fn html_view(body: &str, folder: &str) -> webkit6::WebView {
                 .and_then(|u| u.path_segments().and_then(|mut p| p.next_back().map(str::to_owned)))
                 .map(|n| url::form_urlencoded::parse(format!("x={n}").as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or(n))
                 .unwrap_or("file".into());
-            download_and_open(v, uri.into(), folder.clone(), name, |r| {
+            // Attachment URLs change when the file does, so the URL (minus token) is the version.
+            let version = uri.split("token=").next().unwrap_or(&uri).to_owned();
+            let dl = Dl { url: uri.to_string(), rel: format!("Attachments/{name}"), version };
+            download_and_open(v, dl, folder.clone(), |r| {
                 if let Err(e) = r {
                     eprintln!("download: {e}");
                 }

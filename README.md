@@ -48,4 +48,4 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 
 The keys under `overrides` are mySNS course codes. Each course page shows its code.
 
-Downloads go to `~/Downloads/unibz/<course>/`.
+Opened files are kept in `~/Downloads/unibz/<course>/` (same folder structure as on OLE/Teams) and only downloaded again when they change. OLE courses have “Save all files offline”.

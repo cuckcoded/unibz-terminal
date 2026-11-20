@@ -89,9 +89,19 @@ pub struct Data {
 pub struct Item {
     pub title: String,
     pub subtitle: String,
-    /// (url, file name); url needs no extra auth.
-    pub download: Option<(String, String)>,
+    pub download: Option<Dl>,
     pub web: Option<String>,
+}
+
+/// A file to keep in the local course folder.
+#[derive(Clone)]
+pub struct Dl {
+    /// Needs no extra auth.
+    pub url: String,
+    /// Path inside the course folder, e.g. "Week 1/Slides/intro.pdf".
+    pub rel: String,
+    /// Changes whenever the remote file changes (timestamp, size, eTag…).
+    pub version: String,
 }
 
 fn send(req: ureq::Request, bearer: Option<&str>, f: impl FnOnce(ureq::Request) -> Result<ureq::Response, ureq::Error>) -> Res<Value> {
@@ -330,15 +340,58 @@ pub fn history(a: &Access, sid: i64, q: &str, course_id: i64) -> Res<Vec<(String
     Ok(arr(&v["examSessionEnrollments"]).iter().map(|e| (s(&e["examDate"]).chars().take(10).collect(), s(&e["result"]["descriptionEn"]))).collect())
 }
 
-/// Downloads to ~/Downloads/unibz/<course>/<file> and returns the path.
-pub fn download(url: &str, course: &str, file: &str) -> Res<std::path::PathBuf> {
-    let clean = |x: &str| x.replace(['/', '\0'], "_");
-    let dir = glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir).join("unibz").join(clean(course));
-    std::fs::create_dir_all(&dir).map_err(err)?;
-    let path = dir.join(clean(file));
-    let resp = ureq::get(url).call().map_err(err)?;
-    let mut f = std::fs::File::create(&path).map_err(err)?;
-    std::io::copy(&mut resp.into_reader(), &mut f).map_err(err)?;
+fn course_dir(folder: &str) -> std::path::PathBuf {
+    glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir).join("unibz").join(clean_component(folder))
+}
+
+fn clean_component(x: &str) -> String {
+    let c = x.trim().replace(['/', '\\', '\0'], "_");
+    if c.is_empty() || c == "." || c == ".." { "_".into() } else { c }
+}
+
+/// Safe relative path: every component cleaned, so nothing escapes the course folder.
+fn clean_rel(rel: &str) -> std::path::PathBuf {
+    rel.split('/').filter(|p| !p.trim().is_empty()).map(clean_component).collect()
+}
+
+/// Per-course-folder index of saved files: rel path -> version.
+static INDEX: std::sync::Mutex<Option<HashMap<std::path::PathBuf, HashMap<String, String>>>> = std::sync::Mutex::new(None);
+const INDEX_FILE: &str = ".unibz-cache.json";
+
+fn with_index<T>(dir: &std::path::Path, f: impl FnOnce(&mut HashMap<String, String>) -> T) -> T {
+    let mut all = INDEX.lock().unwrap();
+    let idx = all
+        .get_or_insert_with(HashMap::new)
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| std::fs::read(dir.join(INDEX_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default());
+    f(idx)
+}
+
+/// Whether this exact version is already saved locally.
+pub fn is_cached(folder: &str, dl: &Dl) -> bool {
+    let dir = course_dir(folder);
+    let rel = clean_rel(&dl.rel);
+    dir.join(&rel).is_file() && with_index(&dir, |i| i.get(&*rel.to_string_lossy()) == Some(&dl.version))
+}
+
+/// Returns the local copy, downloading only if missing or outdated.
+pub fn fetch_file(folder: &str, dl: &Dl) -> Res<std::path::PathBuf> {
+    let dir = course_dir(folder);
+    let rel = clean_rel(&dl.rel);
+    let path = dir.join(&rel);
+    if is_cached(folder, dl) {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(path.parent().unwrap_or(&dir)).map_err(err)?;
+    // Download next to the target and rename, so an interrupted download never replaces a good copy.
+    let part = path.with_extension("part-unibz");
+    let resp = ureq::get(&dl.url).call().map_err(err)?;
+    std::io::copy(&mut resp.into_reader(), &mut std::fs::File::create(&part).map_err(err)?).map_err(err)?;
+    std::fs::rename(&part, &path).map_err(err)?;
+    with_index(&dir, |i| {
+        i.insert(rel.to_string_lossy().into_owned(), dl.version.clone());
+        std::fs::write(dir.join(INDEX_FILE), serde_json::to_vec(i).unwrap_or_default()).map_err(err)
+    })?;
     Ok(path)
 }
 
@@ -365,6 +418,11 @@ mod tests {
         assert_eq!(c.next_exam("2026-01-01T00:00:00").unwrap().0, "2026-01-10T09:00:00");
         assert_eq!(c.next_exam("2026-01-11T00:00:00").unwrap().0, "2026-01-20T14:00:00");
         assert!(c.next_exam("2026-03-01T00:00:00").is_none());
+    }
+
+    #[test]
+    fn clean_rel_stays_inside() {
+        assert_eq!(clean_rel("../a//b/../c.pdf"), std::path::PathBuf::from("_/a/b/_/c.pdf"));
     }
 
     #[test]

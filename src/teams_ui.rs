@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk::glib;
 use serde_json::{Value, json};
 
-use crate::api::{self, GRAPH, Item, arr, s};
+use crate::api::{self, Dl, GRAPH, Item, arr, s};
 use crate::auth::Res;
 use crate::ui::*;
 
@@ -131,7 +131,12 @@ fn drive_rows(t: &Rc<Team>, nav: &adw::NavigationView, g: &adw::PreferencesGroup
             let item = Item {
                 title: name.clone(),
                 subtitle: sub,
-                download: it["@microsoft.graph.downloadUrl"].as_str().map(|d| (d.to_owned(), name)),
+                download: it["@microsoft.graph.downloadUrl"].as_str().map(|d| {
+                    // parentReference.path looks like "/drives/{id}/root:/General/Slides".
+                    let parent = s(&it["parentReference"]["path"]);
+                    let parent = parent.split_once("root:").map_or("", |(_, p)| p);
+                    Dl { url: d.to_owned(), rel: format!("Teams/{}/{parent}/{name}", t.name), version: s(&it["eTag"]) }
+                }),
                 web: it["webUrl"].as_str().map(Into::into),
             };
             g.add(&item_row(&item, &t.folder));

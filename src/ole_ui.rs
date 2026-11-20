@@ -7,7 +7,7 @@ use gtk::glib;
 use webkit6::prelude::WebViewExt;
 use serde_json::Value;
 
-use crate::api::{Item, arr, s};
+use crate::api::{Dl, Item, arr, s};
 use crate::auth::{OLE, Res, err};
 use crate::moodle::{self, call, file_url, fix_html};
 use crate::ui::*;
@@ -51,6 +51,40 @@ pub fn tab(o: Rc<Ole>) -> adw::NavigationView {
         });
         g.add(&r);
     }
+    let save = nav_row("Save all files offline", "Downloads new and changed files to ~/Downloads/unibz", "folder-download-symbolic");
+    save.connect_activated({
+        let o = o.clone();
+        move |r| {
+            let (token, id, folder, r2) = (o.token.clone(), o.course, o.folder.clone(), r.clone());
+            r.set_sensitive(false);
+            r.set_subtitle("Saving…");
+            spawn(
+                move || {
+                    let v = call(&token, "core_course_get_contents", &[("courseid", id.to_string())])?;
+                    let (mut total, mut new, mut failed) = (0, 0, 0);
+                    for sec in arr(&v) {
+                        for m in arr(&sec["modules"]) {
+                            for dl in files_of(&token, &section_name(sec), m).into_iter().filter_map(|i| i.download) {
+                                total += 1;
+                                let had = crate::api::is_cached(&folder, &dl);
+                                match crate::api::fetch_file(&folder, &dl) {
+                                    Ok(_) if !had => new += 1,
+                                    Ok(_) => {}
+                                    Err(_) => failed += 1,
+                                }
+                            }
+                        }
+                    }
+                    Ok(format!("{total} files, {new} downloaded now{}", if failed > 0 { format!(", {failed} failed") } else { String::new() }))
+                },
+                move |r: Res<String>| {
+                    r2.set_sensitive(true);
+                    r2.set_subtitle(&esc(&r.unwrap_or_else(|e| format!("Failed: {e}"))));
+                },
+            );
+        }
+    });
+    g.add(&save);
     page.add(&g);
     let loading = group("");
     page.add(&loading);
@@ -68,13 +102,14 @@ pub fn tab(o: Rc<Ole>) -> adw::NavigationView {
                 if sec["uservisible"] == false && sec["visible"] == 0 {
                     continue;
                 }
-                let g = group(&Some(s(&sec["name"])).filter(|n| !n.is_empty()).unwrap_or("General".into()));
+                let section = section_name(sec);
+                let g = group(&section);
                 let summary = strip_html(&s(&sec["summary"]));
                 if !summary.is_empty() {
                     g.set_description(Some(&summary));
                 }
                 for m in arr(&sec["modules"]) {
-                    g.add(&module_row(&o2, &nav2, m));
+                    g.add(&module_row(&o2, &nav2, &section, m));
                 }
                 page2.add(&g);
             }
@@ -97,7 +132,7 @@ fn icon_for(modname: &str) -> &'static str {
     }
 }
 
-fn module_row(o: &Rc<Ole>, nav: &adw::NavigationView, m: &Value) -> gtk::Widget {
+fn module_row(o: &Rc<Ole>, nav: &adw::NavigationView, section: &str, m: &Value) -> gtk::Widget {
     let (name, kind) = (s(&m["name"]), s(&m["modname"]));
     if kind == "label" {
         let r = adw::ActionRow::builder().title(esc(&strip_html(&s(&m["description"])))).title_lines(0).build();
@@ -137,12 +172,12 @@ fn module_row(o: &Rc<Ole>, nav: &adw::NavigationView, m: &Value) -> gtk::Widget 
         }
     }
     r.set_activatable(true);
-    let (o, nav, m) = (o.clone(), nav.clone(), m.clone());
-    r.connect_activated(move |r| open_module(&o, &nav, &m, r));
+    let (o, nav, m, section) = (o.clone(), nav.clone(), m.clone(), section.to_owned());
+    r.connect_activated(move |r| open_module(&o, &nav, &section, &m, r));
     r.upcast()
 }
 
-fn files_of(o: &Ole, m: &Value) -> Vec<Item> {
+fn files_of(token: &str, section: &str, m: &Value) -> Vec<Item> {
     arr(&m["contents"])
         .iter()
         .filter(|f| f["type"] == "file")
@@ -151,23 +186,30 @@ fn files_of(o: &Ole, m: &Value) -> Vec<Item> {
             Item {
                 title: s(&f["filename"]),
                 subtitle: if path == "/" { String::new() } else { path.trim_matches('/').into() },
-                download: Some((file_url(&s(&f["fileurl"]), &o.token), s(&f["filename"]))),
+                download: Some(Dl {
+                    url: file_url(&s(&f["fileurl"]), token),
+                    rel: format!("{section}/{}/{path}/{}", s(&m["name"]), s(&f["filename"])),
+                    version: format!("{}-{}", s(&f["timemodified"]), s(&f["filesize"])),
+                }),
                 web: None,
             }
         })
         .collect()
 }
 
-fn open_module(o: &Rc<Ole>, nav: &adw::NavigationView, m: &Value, r: &adw::ActionRow) {
+fn section_name(sec: &Value) -> String {
+    Some(s(&sec["name"])).filter(|n| !n.is_empty()).unwrap_or("General".into())
+}
+
+fn open_module(o: &Rc<Ole>, nav: &adw::NavigationView, section: &str, m: &Value, r: &adw::ActionRow) {
     let (name, url) = (s(&m["name"]), s(&m["url"]));
-    let files = files_of(o, m);
+    let files = files_of(&o.token, section, m);
     match s(&m["modname"]).as_str() {
         "url" => open_uri(r, &arr(&m["contents"]).first().map(|c| s(&c["fileurl"])).filter(|u| !u.is_empty()).unwrap_or(url)),
         "resource" if files.len() == 1 => {
-            let (r2, it) = (r.clone(), files[0].clone());
-            let (dl, file) = it.download.unwrap();
-            r.set_subtitle("Downloading…");
-            download_and_open(r, dl, o.folder.clone(), file, move |res| r2.set_subtitle(&esc(&res.err().unwrap_or("resource".into()))));
+            let (r2, dl) = (r.clone(), files[0].download.clone().unwrap());
+            r.set_subtitle("Opening…");
+            download_and_open(r, dl, o.folder.clone(), move |res| r2.set_subtitle(&esc(&res.err().unwrap_or("resource".into()))));
         }
         "resource" | "folder" => {
             let page = adw::PreferencesPage::new();
