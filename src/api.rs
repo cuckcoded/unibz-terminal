@@ -77,6 +77,9 @@ impl Course {
 }
 
 pub struct Data {
+    /// mySNS student record (degree, year, matriculation…) and credit/average summary; Null if unavailable.
+    pub profile: Value,
+    pub credits: Value,
     pub student_id: i64,
     pub query: String,
     pub courses: Vec<Course>,
@@ -177,6 +180,8 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
     let ud = get(&format!("{WS}/core/api/Userdata/GetUserdata?{q}"), Some(&a.cockpit))?;
     let sid = ud["StudentId"].as_i64().ok_or("mySNS returned no StudentId")?;
     let career = get(&format!("{API}/studyplan-course-selection/api/Student/{sid}/career?{q}"), Some(&a.cockpit))?;
+    let profile = get(&format!("{API}/studyplan-course-selection/api/Student/{sid}?{q}"), Some(&a.cockpit)).unwrap_or(Value::Null);
+    let credits = get(&format!("{API}/studyplan-course-selection/api/Student/{sid}/creditpoints?{q}"), Some(&a.cockpit)).unwrap_or(Value::Null);
 
     let mut courses = Vec::new();
     let mut seen = BTreeSet::new();
@@ -343,7 +348,7 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         let url = team_urls.get(&id).cloned().unwrap_or("https://teams.microsoft.com/".into());
         (id, name, url)
     });
-    Ok(Data { student_id: sid, query: q, courses, warnings, ole_user, ole: ole.into_iter().map(|(_, c)| c).collect(), teams: teams.collect() })
+    Ok(Data { profile, credits, student_id: sid, query: q, courses, warnings, ole_user, ole: ole.into_iter().map(|(_, c)| c).collect(), teams: teams.collect() })
 }
 
 /// Looks up names of suggested courses you can't see in your own lists. Best effort.

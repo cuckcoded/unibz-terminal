@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod home;
 mod moodle;
 mod ole_ui;
 mod teams_ui;
@@ -94,11 +95,8 @@ async fn load(ui: Rc<Ui>) {
     ui.content.set_child(Some(&toolbar(&status("Loading", "Signing in and fetching mySNS, OLE and Teams…", true), None, &[])));
     match fetch().await {
         Ok((data, access)) => {
-            let msg = format!("{} courses in your study plan.", data.courses.len());
-            let warnings = if data.warnings.is_empty() { String::new() } else { format!("\n\nProblems:\n{}", data.warnings.join("\n")) };
             *ui.state.borrow_mut() = Some(Rc::new(State { data: RefCell::new(data), access }));
-            populate(&ui, None);
-            ui.content.set_child(Some(&toolbar(&status("Pick a course", &format!("{msg}{warnings}"), false), None, &[])));
+            populate(&ui, Some("h:home"));
         }
         Err(e) => ui.content.set_child(Some(&toolbar(&status("Could not load mySNS", &e, false), None, &[]))),
     }
@@ -157,7 +155,10 @@ fn populate(ui: &Rc<Ui>, select: Option<&str>) {
     }
 
     let expanded = ui.expanded.borrow();
-    let mut to_select = None;
+    let home = adw::ActionRow::builder().title("Home").subtitle("Overview and statistics").name("h:home").build();
+    home.add_prefix(&gtk::Image::from_icon_name("go-home-symbolic"));
+    ui.list.append(&home);
+    let mut to_select = (select == Some("h:home")).then_some(home.upcast::<gtk::ListBoxRow>());
     for ((_, folder), mut entries) in folders {
         entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         let open = expanded.contains(&folder) || select.is_some_and(|k| entries.iter().any(|e| e.0 == k));
@@ -171,13 +172,31 @@ fn populate(ui: &Rc<Ui>, select: Option<&str>) {
             let r = adw::ActionRow::builder().title(esc(&title)).subtitle(esc(&sub)).name(&key).margin_start(18).visible(open).build();
             ui.list.append(&r);
             if select == Some(key.as_str()) {
-                to_select = Some(r);
+                to_select = Some(r.upcast());
             }
         }
     }
     drop((expanded, data));
     if let Some(r) = to_select {
         ui.list.select_row(Some(&r));
+    }
+}
+
+/// Selects a sidebar entry, opening its folder first.
+fn select_key(ui: &Ui, key: &str) {
+    let mut folder = None;
+    let mut i = 0;
+    while let Some(r) = ui.list.row_at_index(i) {
+        if r.widget_name().starts_with("f:") {
+            folder = Some(r.clone());
+        } else if r.widget_name() == key {
+            if let Some(f) = folder.filter(|_| !r.is_visible()) {
+                toggle_folder(ui, &f);
+            }
+            ui.list.select_row(Some(&r));
+            return;
+        }
+        i += 1;
     }
 }
 
@@ -206,6 +225,16 @@ fn show(ui: &Rc<Ui>, key: &str) {
     let Some(state) = ui.state.borrow().clone() else { return };
     let (kind, id) = key.split_once(':').unwrap_or_default();
     let (title, page) = match kind {
+        "h" => {
+            let ole = state.access.moodle.clone();
+            let weak = Rc::downgrade(ui);
+            let open: Rc<dyn Fn(&str)> = Rc::new(move |key| {
+                if let Some(ui) = weak.upgrade() {
+                    select_key(&ui, key);
+                }
+            });
+            ("Home".to_owned(), toolbar(&home::page(&state.data.borrow(), ole, open), Some(adw::WindowTitle::new("Home", "").upcast_ref()), &[]))
+        }
         "c" => {
             let data = state.data.borrow();
             let Some(c) = data.courses.iter().find(|c| c.id.to_string() == id).cloned() else { return };

@@ -22,6 +22,7 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 
 ## Layout
 
+- **Home:** your profile, plus stat cards for ECTS progress, weighted average, projected base grade, passed exams, next exam and this week's lectures. It also lists the week's lectures, upcoming exams, OLE deadlines across all courses, recent results and any loading problems.
 - **Sidebar folders:**
   - **This semester:** courses with lectures in the last two weeks or later, or with exam sessions.
   - **Year 1, 2, 3:** the rest of your study plan.
