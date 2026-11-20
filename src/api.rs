@@ -1,15 +1,16 @@
-//! Blocking fetchers for mySNS, OLE (Moodle WS) and Microsoft Graph, plus course matching.
+//! Blocking HTTP helpers, mySNS loading and course matching.
 //! Call these from gio::spawn_blocking.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use gtk::glib;
 use serde_json::Value;
 
-use crate::auth::{Config, OLE, Res, err, user_of};
+use crate::auth::{Config, Res, err, user_of};
+use crate::moodle;
 
 const WS: &str = "https://webservices.scientificnet.org/rest/cm";
 const API: &str = "https://api.scientificnet.org";
-const GRAPH: &str = "https://graph.microsoft.com/v1.0";
+pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 
 #[derive(Clone)]
 pub struct Access {
@@ -54,6 +55,11 @@ pub struct Data {
     pub query: String,
     pub courses: Vec<Course>,
     pub warnings: Vec<String>,
+    /// OLE user id (for autologin) and every enrolled OLE course (id, name).
+    pub ole_user: Option<i64>,
+    pub ole: Vec<(i64, String)>,
+    /// Every joined team (group id, name, web link).
+    pub teams: Vec<(String, String, String)>,
 }
 
 /// A downloadable file or a link, shown as one row.
@@ -66,19 +72,33 @@ pub struct Item {
     pub web: Option<String>,
 }
 
-fn get(url: &str, bearer: Option<&str>) -> Res<Value> {
-    let mut req = ureq::get(url);
-    if let Some(t) = bearer {
-        req = req.set("Authorization", &format!("Bearer {t}"));
-    }
-    match req.call() {
-        Ok(r) => r.into_json().map_err(err),
-        Err(ureq::Error::Status(c, r)) => Err(format!("{c} from {}: {}", url.split('?').next().unwrap_or(url), r.into_string().unwrap_or_default().chars().take(300).collect::<String>())),
+fn send(req: ureq::Request, bearer: Option<&str>, f: impl FnOnce(ureq::Request) -> Result<ureq::Response, ureq::Error>) -> Res<Value> {
+    let url = req.url().split('?').next().unwrap_or_default().to_owned();
+    let req = match bearer {
+        Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+        None => req,
+    };
+    match f(req) {
+        // Some endpoints answer 201/204 with an empty body.
+        Ok(r) => Ok(serde_json::from_str(&r.into_string().map_err(err)?).unwrap_or(Value::Null)),
+        Err(ureq::Error::Status(c, r)) => Err(format!("{c} from {url}: {}", r.into_string().unwrap_or_default().chars().take(300).collect::<String>())),
         Err(e) => Err(err(e)),
     }
 }
 
-fn s(v: &Value) -> String {
+pub fn get(url: &str, bearer: Option<&str>) -> Res<Value> {
+    send(ureq::get(url), bearer, |r| r.call())
+}
+
+pub fn post_form(url: &str, bearer: Option<&str>, form: &[(&str, &str)]) -> Res<Value> {
+    send(ureq::post(url), bearer, |r| r.send_form(form))
+}
+
+pub fn post_json(url: &str, bearer: Option<&str>, body: &Value) -> Res<Value> {
+    send(ureq::post(url), bearer, |r| r.send_json(body))
+}
+
+pub fn s(v: &Value) -> String {
     match v {
         Value::String(x) => x.trim().to_owned(),
         Value::Null => String::new(),
@@ -86,11 +106,11 @@ fn s(v: &Value) -> String {
     }
 }
 
-fn arr(v: &Value) -> &[Value] {
+pub fn arr(v: &Value) -> &[Value] {
     v.as_array().map_or(&[], Vec::as_slice)
 }
 
-fn norm(x: &str) -> String {
+pub fn norm(x: &str) -> String {
     x.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
@@ -113,20 +133,6 @@ fn pick<'a, T>(name: &str, cands: &'a [(String, T)]) -> Vec<&'a T> {
 
 fn query_param(u: &str, key: &str) -> Option<String> {
     url::Url::parse(u).ok()?.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
-}
-
-fn moodle(token: &str, func: &str, args: &[(&str, &str)]) -> Res<Value> {
-    let mut u = url::Url::parse(&format!("{OLE}/webservice/rest/server.php")).unwrap();
-    u.query_pairs_mut().append_pair("wstoken", token).append_pair("wsfunction", func).append_pair("moodlewsrestformat", "json").extend_pairs(args);
-    let v = get(u.as_str(), None)?;
-    // Moodle reports errors with HTTP 200.
-    if v.get("exception").is_some() {
-        if v["errorcode"] == "invalidtoken" {
-            crate::auth::forget_moodle();
-        }
-        return Err(format!("OLE: {}", s(&v["message"])));
-    }
-    Ok(v)
 }
 
 pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
@@ -203,8 +209,12 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
         Err(e) => (warn("Exams login", e.clone()), vec![]).1,
     };
 
+    let mut ole_user = None;
     let ole: Vec<(String, (i64, String))> = match &a.moodle {
-        Ok(t) => match moodle(t, "core_webservice_get_site_info", &[]).and_then(|si| moodle(t, "core_enrol_get_users_courses", &[("userid", &s(&si["userid"]))])) {
+        Ok(t) => match moodle::call(t, "core_webservice_get_site_info", &[]).and_then(|si| {
+            ole_user = si["userid"].as_i64();
+            moodle::call(t, "core_enrol_get_users_courses", &[("userid", s(&si["userid"]))])
+        }) {
             Ok(v) => arr(&v).iter().map(|c| (s(&c["fullname"]), (c["id"].as_i64().unwrap_or_default(), s(&c["fullname"])))).collect(),
             Err(e) => (warn("OLE", e), vec![]).1,
         },
@@ -213,8 +223,16 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
     let ole_names: HashMap<i64, String> = ole.iter().map(|(_, c)| c.clone()).collect();
 
     let teams: Vec<(String, (String, String))> = match &a.graph {
-        Ok(t) => match get(&format!("{GRAPH}/me/joinedTeams?$select=id,displayName"), Some(t)) {
-            Ok(v) => arr(&v["value"]).iter().map(|t| (s(&t["displayName"]), (s(&t["id"]), s(&t["displayName"])))).collect(),
+        Ok(t) => match get(&format!("{GRAPH}/me/joinedTeams?$select=id,displayName,webUrl"), Some(t)) {
+            Ok(v) => arr(&v["value"])
+                .iter()
+                .map(|t| {
+                    if let Some(u) = t["webUrl"].as_str() {
+                        team_urls.entry(s(&t["id"])).or_insert(u.to_owned());
+                    }
+                    (s(&t["displayName"]), (s(&t["id"]), s(&t["displayName"])))
+                })
+                .collect(),
             Err(e) => (warn("Teams list", e), vec![]).1,
         },
         Err(e) => (warn("Microsoft Graph login", e.clone()), vec![]).1,
@@ -260,7 +278,11 @@ pub fn load(a: &Access, cfg: &Config) -> Res<Data> {
     }
     // Current courses first, then open ones, then passed.
     courses.sort_by_key(|c| (c.lectures.is_empty() && c.exams.is_empty(), c.status == "Passed", c.degree_year, c.name.clone()));
-    Ok(Data { student_id: sid, query: q, courses, warnings })
+    let teams = teams.into_iter().map(|(_, (id, name))| {
+        let url = team_urls.get(&id).cloned().unwrap_or("https://teams.microsoft.com/".into());
+        (id, name, url)
+    });
+    Ok(Data { student_id: sid, query: q, courses, warnings, ole_user, ole: ole.into_iter().map(|(_, c)| c).collect(), teams: teams.collect() })
 }
 
 fn timetable(a: &Access, q: &str) -> Res<Vec<Value>> {
@@ -283,83 +305,6 @@ fn timetable(a: &Access, q: &str) -> Res<Vec<Value>> {
 pub fn history(a: &Access, sid: i64, q: &str, course_id: i64) -> Res<Vec<(String, String)>> {
     let v = get(&format!("{API}/studyplan-course-selection/api/Student/{sid}/history/{course_id}?{q}"), Some(&a.cockpit))?;
     Ok(arr(&v["examSessionEnrollments"]).iter().map(|e| (s(&e["examDate"]).chars().take(10).collect(), s(&e["result"]["descriptionEn"]))).collect())
-}
-
-/// OLE course contents: (section name, items).
-pub fn moodle_contents(a: &Access, course: i64) -> Res<Vec<(String, Vec<Item>)>> {
-    let token = a.moodle.clone()?;
-    let v = moodle(&token, "core_course_get_contents", &[("courseid", &course.to_string())])?;
-    let mut out = Vec::new();
-    for sec in arr(&v) {
-        let mut items = Vec::new();
-        for m in arr(&sec["modules"]) {
-            let (name, kind, contents) = (s(&m["name"]), s(&m["modname"]), arr(&m["contents"]));
-            let files: Vec<_> = contents.iter().filter(|f| f["type"] == "file").collect();
-            if kind == "url" {
-                let link = contents.first().map(|c| s(&c["fileurl"])).filter(|u| !u.is_empty()).or(m["url"].as_str().map(Into::into));
-                items.push(Item { title: name, subtitle: "Link".into(), download: None, web: link });
-            } else if files.is_empty() || kind == "folder" && files.len() > 20 {
-                items.push(Item { title: name, subtitle: kind, download: None, web: m["url"].as_str().map(Into::into) });
-            } else {
-                let sub = if files.len() == 1 { kind.clone() } else { format!("{name} · {kind}") };
-                for f in files {
-                    let u = s(&f["fileurl"]);
-                    let u = format!("{u}{}token={token}", if u.contains('?') { '&' } else { '?' });
-                    items.push(Item { title: s(&f["filename"]), subtitle: sub.clone(), download: Some((u, s(&f["filename"]))), web: m["url"].as_str().map(Into::into) });
-                }
-            }
-        }
-        if !items.is_empty() {
-            out.push((s(&sec["name"]), items));
-        }
-    }
-    Ok(out)
-}
-
-/// Every file in a team's SharePoint drive (channel folders included).
-pub fn team_files(a: &Access, team: &str) -> Res<Vec<Item>> {
-    let token = a.graph.clone()?;
-    let mut out = Vec::new();
-    // /groups/{id}/drive 404s for class teams; each channel's filesFolder resolves the real drive.
-    let channels = get(&format!("{GRAPH}/teams/{team}/channels?$select=id,displayName"), Some(&token))?;
-    for ch in arr(&channels["value"]) {
-        let name = s(&ch["displayName"]);
-        let folder = match get(&format!("{GRAPH}/teams/{team}/channels/{}/filesFolder", s(&ch["id"])), Some(&token)) {
-            Ok(f) => f,
-            Err(e) => {
-                out.push(Item { title: format!("{name}: files unavailable"), subtitle: e, download: None, web: None });
-                continue;
-            }
-        };
-        let drive = s(&folder["parentReference"]["driveId"]);
-        walk(&token, &drive, &s(&folder["id"]), &format!("{name}/"), 0, &mut out)?;
-    }
-    out.sort_by(|a, b| (&a.subtitle, &a.title).cmp(&(&b.subtitle, &b.title)));
-    Ok(out)
-}
-
-fn walk(token: &str, drive: &str, item: &str, path: &str, depth: u32, out: &mut Vec<Item>) -> Res<()> {
-    let mut next = Some(format!("{GRAPH}/drives/{drive}/items/{item}/children"));
-    while let Some(u) = next {
-        let v = get(&u, Some(token))?;
-        for it in arr(&v["value"]) {
-            let name = s(&it["name"]);
-            if it.get("folder").is_some() {
-                if depth < 6 {
-                    walk(token, drive, &s(&it["id"]), &format!("{path}{name}/"), depth + 1, out)?;
-                }
-            } else {
-                out.push(Item {
-                    subtitle: path.trim_end_matches('/').into(),
-                    download: it["@microsoft.graph.downloadUrl"].as_str().map(|d| (d.to_owned(), name.clone())),
-                    web: it["webUrl"].as_str().map(Into::into),
-                    title: name,
-                });
-            }
-        }
-        next = v["@odata.nextLink"].as_str().map(Into::into);
-    }
-    Ok(())
 }
 
 /// Downloads to ~/Downloads/unibz/<course>/<file> and returns the path.

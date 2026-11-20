@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashMap, io::Read, path::PathBuf, rc::Rc, 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use gtk::{gio, glib, prelude::*};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use webkit6::prelude::*;
 
@@ -21,7 +21,7 @@ pub const COCKPIT: &str = "https://scientificnet.onmicrosoft.com/CockpitMobileTe
 pub const EXAMS: &str = "https://scientificnet.onmicrosoft.com/mysns-exam-enrolment-evaluation-api/access_as_user";
 pub const GRAPH: &str = "https://graph.microsoft.com/.default";
 
-#[derive(Default, Clone, Deserialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub moodle_token: Option<String>,
@@ -31,7 +31,7 @@ pub struct Config {
     pub overrides: HashMap<String, Override>,
 }
 
-#[derive(Default, Clone, Deserialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Override {
     pub moodle: Vec<i64>,
@@ -79,9 +79,14 @@ pub fn config() -> Config {
         .unwrap_or_default()
 }
 
+pub fn save_config(cfg: &Config) -> Res<()> {
+    std::fs::create_dir_all(dir()).map_err(err)?;
+    std::fs::write(dir().join("config.json"), serde_json::to_vec_pretty(cfg).map_err(err)?).map_err(err)
+}
+
 static TOKENS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
-fn stored(key: &str) -> Option<String> {
+pub fn stored(key: &str) -> Option<String> {
     let mut t = TOKENS.lock().unwrap();
     t.get_or_insert_with(|| {
         std::fs::read(dir().join("tokens.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
@@ -187,13 +192,22 @@ pub async fn moodle_token(cfg: &Config) -> Res<String> {
     let b64 = back.split("token=").nth(1).ok_or("OLE returned no token")?.trim_end_matches('/');
     let decoded = String::from_utf8(STANDARD.decode(b64).map_err(err)?).map_err(err)?;
     // Format: sitehash:::token[:::privatetoken]
-    let token = decoded.split(":::").nth(1).ok_or("unexpected OLE token format")?.to_owned();
+    let mut parts = decoded.split(":::").skip(1);
+    let token = parts.next().ok_or("unexpected OLE token format")?.to_owned();
     store("moodle", Some(token.clone()));
+    // The private token lets the embedded OLE browser log in automatically.
+    store("moodle_private", parts.next().map(Into::into));
     Ok(token)
 }
 
 pub fn forget_moodle() {
     store("moodle", None);
+    store("moodle_private", None);
+}
+
+/// A WebView sharing the login cookies of the sign-in windows.
+pub fn web_view() -> webkit6::WebView {
+    SESSION.with(|s| webkit6::WebView::builder().network_session(s).build())
 }
 
 thread_local! {
@@ -212,7 +226,7 @@ thread_local! {
 async fn webview_login(title: &str, url: &str, prefix: &str) -> Res<String> {
     let (tx, rx) = futures_channel::oneshot::channel::<String>();
     let tx = Rc::new(RefCell::new(Some(tx)));
-    let view = SESSION.with(|s| webkit6::WebView::builder().network_session(s).build());
+    let view = web_view();
     let win = gtk::Window::builder().title(title).default_width(520).default_height(720).modal(true).child(&view).build();
     if let Some(parent) = gio::Application::default().and_downcast::<gtk::Application>().and_then(|a| a.active_window()) {
         win.set_transient_for(Some(&parent));

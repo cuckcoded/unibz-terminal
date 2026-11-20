@@ -18,11 +18,22 @@ You sign in in embedded browser windows, and the cookies are kept, so later sign
 
 Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 
+## Layout
+
+- **Sidebar folders:**
+  - **This semester:** courses with lectures in the last two weeks or later, or with exam sessions.
+  - **Year 1, 2, 3:** the rest of your study plan.
+  - **Other OLE courses** and **Other teams:** everything not linked to a mySNS course.
+- **Course page tabs:**
+  - **mySNS:** grade, attempts, exam sessions, lectures and linked courses.
+  - **OLE:** one tab per linked OLE course. Files, pages, forums (read, reply, new discussion), assignments (status, feedback, online text, file upload, submitting), completion checkboxes, grades, participants and deadlines work natively. Other activities, like quizzes, open the real OLE page, signed in, inside the app.
+  - **Teams:** one tab per linked team, with channels (posts, replies, new posts, channel tabs, files) and the team's SharePoint libraries.
+
 ## Course matching
 
 1. Every mySNS timetable entry carries its OLE course id and Teams group id. These are used first.
 2. If a course has neither, it is matched to OLE courses and teams by name.
-3. To set the matches by hand, edit `~/.config/unibz-terminal/config.json`:
+3. To change a match, use **Assign…** or the unlink buttons on the mySNS tab, or **Assign to course…** on an unlinked OLE course or team. Changes are saved to `~/.config/unibz-terminal/config.json`, which you can also edit by hand:
 
 ```json
 {
