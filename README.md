@@ -25,8 +25,9 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 - **Home:** your profile, plus stat cards for ECTS progress, weighted average, projected base grade, passed exams, next exam and this week's lectures. It also lists the week's lectures, upcoming exams, OLE deadlines across all courses, recent results and any loading problems.
 - **Calendar:**
   - Day, week, month and year views.
-  - It shows mySNS lectures and exams, OLE calendar events (deadlines, course and personal events) and Teams assignments, color-coded by source.
-  - Click an event to open its course, or a Teams assignment in Teams. Click a day in the month or year view to open it.
+  - It shows mySNS lectures and exams and OLE calendar events (deadlines, course and personal events), color-coded by source.
+  - Events are cards showing time, course, type, room and lecturer. A lunch bar (12:00–13:30) separates morning and afternoon and opens the Mensa page.
+  - Click an event to open its course. Click a day in the month or year view to open it.
 - **Home lectures:** Home lists one day of lectures at a time, with buttons for the previous day, today and the next day.
 - **Mensa:**
   - Your credit, read from the mensa reserved area. Sign-in uses the "SNS Access UNIBZ" button with your existing Microsoft session. The credit also appears on Home.

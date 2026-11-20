@@ -1,4 +1,4 @@
-//! Calendar: mySNS lectures and exams, OLE events and Teams assignments by day, week, month or year.
+//! Calendar: mySNS lectures and exams and OLE events by day, week, month or year.
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -8,7 +8,7 @@ use std::{
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::api::{self, Data, GRAPH, arr, s};
+use crate::api::{self, Data, arr, s};
 use crate::auth::{OLE, Res};
 use crate::moodle;
 use crate::ui::*;
@@ -18,17 +18,15 @@ pub enum Kind {
     Lecture,
     Exam,
     Ole,
-    Teams,
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::Lecture, Kind::Exam, Kind::Ole, Kind::Teams];
+    const ALL: [Kind; 3] = [Kind::Lecture, Kind::Exam, Kind::Ole];
     fn css(self) -> &'static str {
         match self {
             Kind::Lecture => "cal-lecture",
             Kind::Exam => "cal-exam",
             Kind::Ole => "cal-ole",
-            Kind::Teams => "cal-teams",
         }
     }
     fn label(self) -> &'static str {
@@ -36,7 +34,6 @@ impl Kind {
             Kind::Lecture => "Lectures",
             Kind::Exam => "Exams",
             Kind::Ole => "OLE",
-            Kind::Teams => "Teams assignments",
         }
     }
 }
@@ -49,6 +46,8 @@ pub struct Event {
     pub all_day: bool,
     pub title: String,
     pub detail: String,
+    pub place: String,
+    pub people: String,
     pub kind: Kind,
     /// Sidebar key ("c:12") or a URL to open.
     pub target: String,
@@ -71,7 +70,7 @@ pub fn sns_events(data: &Data) -> Vec<Event> {
             let (Some(start), Some(end)) = (unix(&l.start), unix(&l.end)) else { continue };
             let exam = l.kind == "EXAM";
             let title = if exam { format!("Exam · {}", c.name) } else { c.name.clone() };
-            out.push(Event { start, end, all_day: false, title, detail: join(&[&l.activity, &l.room]), kind: if exam { Kind::Exam } else { Kind::Lecture }, target: key.clone() });
+            out.push(Event { start, end, all_day: false, title, detail: l.activity.clone(), place: l.room.clone(), people: l.staff.clone(), kind: if exam { Kind::Exam } else { Kind::Lecture }, target: key.clone() });
         }
         for e in &c.exams {
             let Some(date) = s(&e["examDate"]).get(..10).map(str::to_owned) else { continue };
@@ -87,7 +86,9 @@ pub fn sns_events(data: &Data) -> Vec<Event> {
                 end: start,
                 all_day: hm.is_none(),
                 title: format!("Exam · {}", c.name),
-                detail: join(&[&s(&e["examTypeDescription"]), &s(&e["location"]), enrolled]),
+                detail: join(&[&s(&e["examTypeDescription"]), enrolled]),
+                place: s(&e["location"]),
+                people: s(&e["examProfessorName"]),
                 kind: Kind::Exam,
                 target: key.clone(),
             });
@@ -96,14 +97,13 @@ pub fn sns_events(data: &Data) -> Vec<Event> {
     out
 }
 
-/// Sidebar key for an OLE course id or team id: the mySNS course it's linked to, else its own entry.
-fn key_for(data: &Data, ole: Option<i64>, team: Option<&str>) -> String {
+/// Sidebar key for an OLE course id: the mySNS course it's linked to, else its own entry.
+fn key_for(data: &Data, ole: Option<i64>) -> String {
     data.courses
         .iter()
-        .find(|c| ole.is_some_and(|o| c.moodle.iter().any(|m| m.0 == o)) || team.is_some_and(|t| c.teams.iter().any(|x| x.0 == t)))
+        .find(|c| ole.is_some_and(|o| c.moodle.iter().any(|m| m.0 == o)))
         .map(|c| format!("c:{}", c.id))
         .or_else(|| ole.map(|o| format!("o:{o}")))
-        .or_else(|| team.map(|t| format!("t:{t}")))
         .unwrap_or_default()
 }
 
@@ -124,38 +124,13 @@ fn ole_events(token: &str, courses: &[(i64, String, String)], from: i64, to: i64
                 all_day: false,
                 title: s(&e["name"]),
                 detail: course.map(|c| c.1.clone()).unwrap_or_default(),
+                place: String::new(),
+                people: String::new(),
                 kind: Kind::Ole,
                 target: course.map(|c| c.2.clone()).unwrap_or_else(|| format!("{OLE}/calendar/view.php?view=day&time={start}")),
             }
         })
         .collect())
-}
-
-/// Assignments from Teams (Graph education API), keyed by due date. `classes` maps team id to (name, sidebar key).
-fn teams_events(token: &str, classes: &HashMap<String, (String, String)>) -> Res<Vec<Event>> {
-    let mut out = Vec::new();
-    let mut url = format!("{GRAPH}/education/me/assignments");
-    loop {
-        let v = api::get(&url, Some(token))?;
-        for a in arr(&v["value"]) {
-            let Some(due) = a["dueDateTime"].as_str().and_then(unix) else { continue };
-            let class = classes.get(&s(&a["classId"]));
-            let web = s(&a["webUrl"]);
-            out.push(Event {
-                start: due,
-                end: due,
-                all_day: false,
-                title: s(&a["displayName"]),
-                detail: join(&[class.map_or("", |c| c.0.as_str()), &s(&a["status"])]),
-                kind: Kind::Teams,
-                target: if web.is_empty() { class.map(|c| c.1.clone()).unwrap_or_default() } else { web },
-            });
-        }
-        match v["@odata.nextLink"].as_str() {
-            Some(next) => url = next.to_owned(),
-            None => return Ok(out),
-        }
-    }
 }
 
 fn day_key(d: &glib::DateTime) -> String {
@@ -204,17 +179,20 @@ const CSS: &str = "
 .cal-dot.cal-lecture { background-color: @accent_bg_color; }
 .cal-dot.cal-exam { background-color: @error_bg_color; }
 .cal-dot.cal-ole { background-color: @warning_bg_color; }
-.cal-dot.cal-teams { background-color: #6264a7; }
 .cal-chip { border-radius: 6px; padding: 2px 6px; font-size: 0.85em; min-height: 0; }
 .cal-chip.cal-lecture { background-color: alpha(@accent_bg_color, 0.2); }
 .cal-chip.cal-exam { background-color: alpha(@error_bg_color, 0.25); }
 .cal-chip.cal-ole { background-color: alpha(@warning_bg_color, 0.3); }
-.cal-chip.cal-teams { background-color: alpha(#6264a7, 0.3); }
 .cal-cell { padding: 4px; border-radius: 8px; }
 .cal-today { color: @accent_color; font-weight: bold; }
 .cal-day { min-width: 26px; min-height: 26px; padding: 0; font-size: 0.85em; }
 .cal-busy { background-color: alpha(@accent_bg_color, 0.2); }
-.cal-lunch { background-color: alpha(@success_bg_color, 0.15); border: 1px dashed alpha(@success_bg_color, 0.7); border-radius: 6px; padding: 1px 6px; min-height: 0; font-size: 0.8em; }
+.cal-lunch { background-color: alpha(@success_bg_color, 0.15); border: 1px dashed alpha(@success_bg_color, 0.7); border-radius: 6px; padding: 2px 8px; min-height: 0; font-size: 0.85em; }
+.cal-event { border-radius: 10px; padding: 8px 10px; border-left: 4px solid; font-weight: normal; }
+.cal-event.cal-lecture { border-left-color: @accent_bg_color; background-color: alpha(@accent_bg_color, 0.12); }
+.cal-event.cal-exam { border-left-color: @error_bg_color; background-color: alpha(@error_bg_color, 0.14); }
+.cal-event.cal-ole { border-left-color: @warning_bg_color; background-color: alpha(@warning_bg_color, 0.16); }
+.cal-event .cal-title { font-weight: bold; }
 ";
 
 fn install_css() {
@@ -307,10 +285,26 @@ impl Cal {
         self.holder.set_child(Some(&child));
     }
 
-    fn chip(self: &Rc<Self>, e: &Event, with_detail: bool) -> gtk::Button {
-        let text = if with_detail { format!("{}  {}\n{}", when(e), e.title, e.detail) } else { format!("{}  {}", when(e), e.title) };
-        let label = gtk::Label::builder().label(text.trim_end()).xalign(0.0).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).build();
-        let b = gtk::Button::builder().child(&label).css_classes(["cal-chip", e.kind.css()]).tooltip_text(join(&[&when(e), &e.title, &e.detail])).build();
+    /// Timetable card: time, course, then type, room and lecturer on their own lines.
+    fn card(self: &Rc<Self>, e: &Event) -> gtk::Button {
+        let label = |text: &str, classes: &[&str]| {
+            gtk::Label::builder().label(text).xalign(0.0).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).css_classes(classes.to_vec()).build()
+        };
+        let v = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(3).build();
+        v.append(&label(&when(e), &["caption", "dim-label"]));
+        v.append(&label(&e.title, &["cal-title"]));
+        if !e.detail.is_empty() {
+            v.append(&label(&e.detail, &["caption"]));
+        }
+        for (icon, text) in [("mark-location-symbolic", &e.place), ("system-users-symbolic", &e.people)] {
+            if !text.is_empty() {
+                let line = gtk::Box::builder().spacing(6).build();
+                line.append(&gtk::Image::builder().icon_name(icon).pixel_size(12).css_classes(["dim-label"]).build());
+                line.append(&label(text, &["caption", "dim-label"]));
+                v.append(&line);
+            }
+        }
+        let b = gtk::Button::builder().child(&v).css_classes(["cal-event", e.kind.css()]).tooltip_text(join(&[&when(e), &e.title, &e.detail, &e.place, &e.people])).build();
         let (weak, target) = (Rc::downgrade(self), e.target.clone());
         b.connect_clicked(move |b| {
             if let Some(c) = weak.upgrade() {
@@ -323,8 +317,9 @@ impl Cal {
     fn lunch_bar(self: &Rc<Self>) -> gtk::Button {
         let content = gtk::Box::builder().spacing(6).build();
         content.append(&gtk::Image::from_icon_name("emoji-food-symbolic"));
-        content.append(&gtk::Label::new(Some(LUNCH.2)));
-        let b = gtk::Button::builder().child(&content).css_classes(["cal-lunch"]).tooltip_text("Open the mensa menu").build();
+        let hm = |m: i64| format!("{:02}:{:02}", m / 60, m % 60);
+        content.append(&gtk::Label::new(Some(&format!("Lunch · {}–{}", hm(LUNCH.0), hm(LUNCH.1)))));
+        let b = gtk::Button::builder().child(&content).css_classes(["cal-lunch"]).tooltip_text("Open the mensa menu").hexpand(true).build();
         let weak = Rc::downgrade(self);
         b.connect_clicked(move |_| {
             if let Some(c) = weak.upgrade() {
@@ -336,35 +331,19 @@ impl Cal {
 
     fn day_view(self: &Rc<Self>, day: &glib::DateTime) -> gtk::Widget {
         let evs = self.on(day);
-        let lunch = lunch_slot(day, &evs);
-        if evs.is_empty() && lunch.is_none() {
+        if evs.is_empty() {
             return adw::StatusPage::builder().icon_name("x-office-calendar-symbolic").title("Nothing on this day").build().upcast();
         }
-        let list = gtk::ListBox::builder().css_classes(["boxed-list"]).selection_mode(gtk::SelectionMode::None).valign(gtk::Align::Start).build();
-        let lunch_row = || gtk::ListBoxRow::builder().child(&self.lunch_bar()).activatable(false).build();
-        let count = evs.len();
-        for (i, e) in evs.into_iter().enumerate() {
-            if lunch == Some(i) {
-                list.append(&lunch_row());
-            }
-            let r = row(&e.title, &join(&[&when(&e), &e.detail]));
-            r.add_prefix(&dot(e.kind));
-            if !e.target.is_empty() {
-                r.set_activatable(true);
-                r.add_suffix(&gtk::Image::from_icon_name(if e.target.starts_with("http") { "adw-external-link-symbolic" } else { "go-next-symbolic" }));
-                let weak = Rc::downgrade(self);
-                r.connect_activated(move |r| {
-                    if let Some(c) = weak.upgrade() {
-                        c.activate(r, &e.target);
-                    }
-                });
-            }
-            list.append(&r);
+        let (morning, afternoon) = split_at_lunch(day, evs);
+        let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).valign(gtk::Align::Start).build();
+        for e in &morning {
+            list.append(&self.card(e));
         }
-        if lunch == Some(count) {
-            list.append(&lunch_row());
+        list.append(&self.lunch_bar());
+        for e in &afternoon {
+            list.append(&self.card(e));
         }
-        scrolled(&adw::Clamp::builder().maximum_size(800).child(&list).margin_top(6).margin_bottom(18).margin_start(12).margin_end(12).build())
+        scrolled(&adw::Clamp::builder().maximum_size(700).child(&list).margin_top(6).margin_bottom(18).margin_start(12).margin_end(12).build())
     }
 
     fn day_button(self: &Rc<Self>, child: &impl IsA<gtk::Widget>, day: &glib::DateTime) -> gtk::Button {
@@ -379,7 +358,7 @@ impl Cal {
     }
 
     fn week_view(self: &Rc<Self>, start: &glib::DateTime) -> gtk::Widget {
-        let grid = gtk::Grid::builder().column_homogeneous(true).column_spacing(8).row_spacing(8).margin_start(12).margin_end(12).margin_bottom(18).build();
+        let grid = gtk::Grid::builder().column_homogeneous(true).column_spacing(10).row_spacing(10).margin_start(12).margin_end(12).margin_bottom(18).build();
         let today = today_key();
         for i in 0..7 {
             let Ok(d) = start.add_days(i) else { continue };
@@ -388,21 +367,19 @@ impl Cal {
                 head.add_css_class("cal-today");
             }
             grid.attach(&self.day_button(&head, &d), i, 0, 1, 1);
-            let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-            let evs = self.on(&d);
-            let lunch = lunch_slot(&d, &evs);
-            for (j, e) in evs.iter().enumerate() {
-                if lunch == Some(j) {
-                    col.append(&self.lunch_bar());
+            let (morning, afternoon) = split_at_lunch(&d, self.on(&d));
+            for (row, evs) in [(1, morning), (3, afternoon)] {
+                let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).width_request(150).valign(if row == 1 { gtk::Align::End } else { gtk::Align::Start }).build();
+                for e in &evs {
+                    col.append(&self.card(e));
                 }
-                col.append(&self.chip(e, true));
+                grid.attach(&col, i, row, 1, 1);
             }
-            if lunch == Some(evs.len()) {
-                col.append(&self.lunch_bar());
-            }
-            grid.attach(&col, i, 1, 1, 1);
         }
-        scrolled(&grid)
+        grid.attach(&self.lunch_bar(), 0, 2, 7, 1);
+        // Narrow windows scroll sideways instead of squeezing the cards.
+        let sw = gtk::ScrolledWindow::builder().child(&grid).vexpand(true).build();
+        sw.upcast()
     }
 
     fn month_view(self: &Rc<Self>, a: &glib::DateTime) -> gtk::Widget {
@@ -486,16 +463,13 @@ impl Cal {
     }
 }
 
-/// Mensa lunch service. shortcut: fixed hours, not read from the mensa site; adjust here if they change.
-const LUNCH: (u32, u32, &str) = (12, 14, "Lunch · 12:00–14:00");
+/// Mensa lunch service, (start, end) in minutes after midnight.
+const LUNCH: (i64, i64) = (12 * 60, 13 * 60 + 30);
 
-/// Where the lunch bar goes among a day's sorted events; None on Sundays (mensa closed).
-fn lunch_slot(day: &glib::DateTime, evs: &[Event]) -> Option<usize> {
-    if day.day_of_week() == 7 {
-        return None;
-    }
-    let noon = midnight(day).to_unix() + LUNCH.0 as i64 * 3600;
-    Some(evs.iter().position(|e| !e.all_day && e.start >= noon).unwrap_or(evs.len()))
+/// A day's events before lunch (including all-day ones) and from lunch on.
+fn split_at_lunch(day: &glib::DateTime, evs: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
+    let lunch = midnight(day).to_unix() + LUNCH.0 * 60;
+    evs.into_iter().partition(|e| e.all_day || e.start < lunch)
 }
 
 fn today_key() -> String {
@@ -582,7 +556,7 @@ pub fn page(data: &Data, access: &api::Access, open: Rc<dyn Fn(&str)>) -> gtk::W
         }
     });
 
-    // OLE and Teams load in the background over the academic year (Sep 1 to Sep 1).
+    // OLE loads in the background over the academic year (Sep 1 to Sep 1).
     let year = if now.month() >= 9 { now.year() } else { now.year() - 1 };
     let from = glib::DateTime::from_local(year, 9, 1, 0, 0, 0.0).map(|d| d.to_unix()).unwrap_or_default();
     let to = from + 366 * 86400;
@@ -604,19 +578,11 @@ pub fn page(data: &Data, access: &api::Access, open: Rc<dyn Fn(&str)>) -> gtk::W
     match &access.moodle {
         Ok(token) => {
             let token = token.clone();
-            let courses: Vec<(i64, String, String)> = data.ole.iter().map(|(id, name)| (*id, name.clone(), key_for(data, Some(*id), None))).collect();
+            let courses: Vec<(i64, String, String)> = data.ole.iter().map(|(id, name)| (*id, name.clone(), key_for(data, Some(*id)))).collect();
             let report = report.clone();
             spawn(move || ole_events(&token, &courses, from, to), move |r| report("OLE", r));
         }
         Err(e) => report("OLE", Err(e.clone())),
-    }
-    match &access.graph {
-        Ok(token) => {
-            let token = token.clone();
-            let classes: HashMap<String, (String, String)> = data.teams.iter().map(|(id, name, _)| (id.clone(), (name.clone(), key_for(data, None, Some(id))))).collect();
-            spawn(move || teams_events(&token, &classes), move |r| report("Teams assignments", r));
-        }
-        Err(e) => report("Teams assignments", Err(e.clone())),
     }
     outer.upcast()
 }
@@ -628,16 +594,16 @@ mod tests {
     #[test]
     fn index_groups_by_local_day_and_sorts() {
         let t = |iso: &str| unix(iso).unwrap();
-        let ev = |start, all_day| Event { start, end: start, all_day, title: String::new(), detail: String::new(), kind: Kind::Ole, target: String::new() };
+        let ev = |start, all_day| Event { start, end: start, all_day, title: String::new(), detail: String::new(), place: String::new(), people: String::new(), kind: Kind::Ole, target: String::new() };
         let idx = index(&[ev(t("2026-11-20T14:00:00"), false), ev(t("2026-11-20T09:00:00"), false), ev(t("2026-11-20T00:00:00"), true), ev(t("2026-11-21T08:00:00"), false)]);
         let day = &idx["2026-11-20"];
         assert_eq!(day.len(), 3);
         assert!(day[0].all_day);
         assert_eq!(hm(day[1].start), "09:00");
         assert_eq!(idx["2026-11-21"].len(), 1);
-        // Lunch goes after the morning events; no lunch on Sunday.
+        // All-day and morning events come before lunch, 12:00 on after it.
         let fri = glib::DateTime::from_local(2026, 11, 20, 0, 0, 0.0).unwrap();
-        assert_eq!(lunch_slot(&fri, day), Some(2));
-        assert_eq!(lunch_slot(&fri.add_days(2).unwrap(), &[]), None);
+        let (am, pm) = split_at_lunch(&fri, day.clone());
+        assert_eq!((am.len(), pm.len()), (2, 1));
     }
 }
