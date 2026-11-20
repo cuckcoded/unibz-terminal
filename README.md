@@ -3,7 +3,9 @@
 GTK4/libadwaita app that combines mySNS (grades, exam sessions, timetable), OLE (Moodle) and Microsoft Teams files, organized by course.
 
 ```sh
-cargo run
+./install.sh              # build and install to ~/.local (adds an app menu entry)
+./install.sh --uninstall  # remove it; keeps config, tokens and downloaded files
+cargo run                 # or run straight from the source tree
 ```
 
 Needs gtk4 ≥ 4.14, libadwaita ≥ 1.6 and webkitgtk-6.0.
