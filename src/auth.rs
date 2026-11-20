@@ -29,6 +29,9 @@ pub struct Config {
     pub graph_redirect_uri: Option<String>,
     /// mySNS course code -> manual OLE/Teams assignment (replaces auto-matching).
     pub overrides: HashMap<String, Override>,
+    /// Mensa: menu id (see mensa::LOCATIONS) and what one meal costs you.
+    pub mensa_location: Option<String>,
+    pub mensa_meal_price: Option<f64>,
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -222,15 +225,19 @@ thread_local! {
     };
 }
 
+pub fn set_parent(win: &gtk::Window) {
+    if let Some(parent) = gio::Application::default().and_downcast::<gtk::Application>().and_then(|a| a.active_window()) {
+        win.set_transient_for(Some(&parent));
+    }
+}
+
 /// Shows a login window and resolves with the first navigated URL starting with `prefix`.
 async fn webview_login(title: &str, url: &str, prefix: &str) -> Res<String> {
     let (tx, rx) = futures_channel::oneshot::channel::<String>();
     let tx = Rc::new(RefCell::new(Some(tx)));
     let view = web_view();
     let win = gtk::Window::builder().title(title).default_width(520).default_height(720).modal(true).child(&view).build();
-    if let Some(parent) = gio::Application::default().and_downcast::<gtk::Application>().and_then(|a| a.active_window()) {
-        win.set_transient_for(Some(&parent));
-    }
+    set_parent(&win);
     let (prefix, weak, tx2) = (prefix.to_owned(), win.downgrade(), tx.clone());
     view.connect_decide_policy(move |_, decision, _| {
         let uri = decision

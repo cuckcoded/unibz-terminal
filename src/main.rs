@@ -1,6 +1,8 @@
 mod api;
 mod auth;
 mod home;
+mod mensa;
+mod mensa_ui;
 mod moodle;
 mod ole_ui;
 mod teams_ui;
@@ -158,6 +160,9 @@ fn populate(ui: &Rc<Ui>, select: Option<&str>) {
     let home = adw::ActionRow::builder().title("Home").subtitle("Overview and statistics").name("h:home").build();
     home.add_prefix(&gtk::Image::from_icon_name("go-home-symbolic"));
     ui.list.append(&home);
+    let mensa = adw::ActionRow::builder().title("Mensa").subtitle("Credit and menu").name("m:mensa").build();
+    mensa.add_prefix(&gtk::Image::from_icon_name("emoji-food-symbolic"));
+    ui.list.append(&mensa);
     let mut to_select = (select == Some("h:home")).then_some(home.upcast::<gtk::ListBoxRow>());
     for ((_, folder), mut entries) in folders {
         entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
@@ -235,6 +240,7 @@ fn show(ui: &Rc<Ui>, key: &str) {
             });
             ("Home".to_owned(), toolbar(&home::page(&state.data.borrow(), ole, open), Some(adw::WindowTitle::new("Home", "").upcast_ref()), &[]))
         }
+        "m" => ("Mensa".to_owned(), toolbar(&mensa_ui::page(), Some(adw::WindowTitle::new("Mensa", "").upcast_ref()), &[])),
         "c" => {
             let data = state.data.borrow();
             let Some(c) = data.courses.iter().find(|c| c.id.to_string() == id).cloned() else { return };
