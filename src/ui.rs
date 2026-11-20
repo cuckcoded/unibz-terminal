@@ -300,3 +300,156 @@ mod tests {
         assert_eq!(super::strip_html("<p>Hello&nbsp;<b>world</b></p><p>a &amp; b</p>"), "Hello world\na & b");
     }
 }
+
+mod masonry_imp {
+    use gtk::{glib, prelude::*, subclass::prelude::*};
+
+    pub const COL_MIN: i32 = 380;
+    pub const GAP: i32 = 24;
+    pub const MAX_COLS: i32 = 3;
+
+    #[derive(Default)]
+    pub struct Masonry;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Masonry {
+        const NAME: &'static str = "UnibzMasonry";
+        type Type = super::Masonry;
+        type ParentType = gtk::LayoutManager;
+    }
+
+    impl ObjectImpl for Masonry {}
+
+    fn children(w: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = Vec::new();
+        let mut c = w.first_child();
+        while let Some(x) = c {
+            c = x.next_sibling();
+            if x.should_layout() {
+                out.push(x);
+            }
+        }
+        out
+    }
+
+    /// Narrowest a column may be: the default, or wider if a child needs it.
+    fn col_min(w: &gtk::Widget) -> i32 {
+        children(w).iter().map(|c| c.measure(gtk::Orientation::Horizontal, -1).0).max().unwrap_or(0).max(COL_MIN)
+    }
+
+    /// Puts each child into the currently shortest column. Returns (child, x, y, w, h) and the total height.
+    pub fn place(w: &gtk::Widget, width: i32) -> (Vec<(gtk::Widget, i32, i32, i32, i32)>, i32) {
+        let min = col_min(w);
+        let cols = ((width + GAP) / (min + GAP)).clamp(1, MAX_COLS);
+        let colw = ((width - GAP * (cols - 1)) / cols).max(min.min(width));
+        let mut heights = vec![0; cols as usize];
+        let mut out = Vec::new();
+        for c in children(w) {
+            let col = (0..cols as usize).min_by_key(|&i| heights[i]).unwrap_or(0);
+            let h = c.measure(gtk::Orientation::Vertical, colw).1;
+            out.push((c, col as i32 * (colw + GAP), heights[col], colw, h));
+            if h > 0 {
+                heights[col] += h + GAP;
+            }
+        }
+        (out, (heights.into_iter().max().unwrap_or(0) - GAP).max(0))
+    }
+
+    impl LayoutManagerImpl for Masonry {
+        fn request_mode(&self, _: &gtk::Widget) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::HeightForWidth
+        }
+
+        fn measure(&self, w: &gtk::Widget, o: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let min = col_min(w);
+            if o == gtk::Orientation::Horizontal {
+                (min, MAX_COLS * min + (MAX_COLS - 1) * GAP, -1, -1)
+            } else {
+                let h = place(w, if for_size < 0 { min } else { for_size }).1;
+                (h, h, -1, -1)
+            }
+        }
+
+        fn allocate(&self, w: &gtk::Widget, width: i32, _height: i32, _baseline: i32) {
+            for (c, x, y, cw, ch) in place(w, width).0 {
+                c.size_allocate(&gtk::Allocation::new(x, y, cw, ch), -1);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    /// Masonry layout: children flow into 1–3 columns depending on the width.
+    pub struct Masonry(ObjectSubclass<masonry_imp::Masonry>) @extends gtk::LayoutManager;
+}
+
+/// Drop-in for adw::PreferencesPage that uses wide windows: groups go into as many columns as fit.
+#[derive(Clone)]
+pub struct WidePage {
+    pub root: gtk::ScrolledWindow,
+    top: gtk::Box,
+    cols: gtk::Box,
+}
+
+impl WidePage {
+    pub fn new() -> Self {
+        let top = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
+        let cols = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        cols.set_layout_manager(Some(glib::Object::new::<Masonry>()));
+        let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(24).margin_top(24).margin_bottom(24).margin_start(18).margin_end(18).build();
+        content.append(&top);
+        content.append(&cols);
+        let clamp = adw::Clamp::builder().maximum_size(1400).tightening_threshold(1000).child(&content).build();
+        let root = gtk::ScrolledWindow::builder().child(&clamp).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
+        Self { root, top, cols }
+    }
+
+    /// Full width, above the columns.
+    pub fn add_top(&self, w: &impl IsA<gtk::Widget>) {
+        self.top.append(w);
+    }
+
+    pub fn add(&self, w: &impl IsA<gtk::Widget>) {
+        self.cols.append(w);
+    }
+
+    pub fn remove(&self, w: &impl IsA<gtk::Widget>) {
+        if w.parent().as_ref() == Some(self.cols.upcast_ref()) {
+            self.cols.remove(w);
+        } else if w.parent().as_ref() == Some(self.top.upcast_ref()) {
+            self.top.remove(w);
+        }
+    }
+}
+
+/// App-wide stylesheet pieces; call once at startup.
+pub fn load_css(parts: &[&str]) {
+    let p = gtk::CssProvider::new();
+    p.load_from_string(&parts.concat());
+    if let Some(d) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&d, &p, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
+#[cfg(test)]
+mod masonry_tests {
+    use adw::prelude::*;
+
+    #[test]
+    fn columns_by_width() {
+        gtk::init().unwrap();
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for h in [300, 100, 100, 100] {
+            b.append(&gtk::Box::builder().height_request(h).build());
+        }
+        let w: gtk::Widget = b.into();
+        // Narrow: one column, stacked.
+        let (one, total) = super::masonry_imp::place(&w, 400);
+        assert!(one.iter().all(|c| c.1 == 0));
+        assert_eq!(total, 300 + 100 * 3 + 24 * 3);
+        // Wide: the tall one gets its own column, the rest fill the shortest columns.
+        let (three, total) = super::masonry_imp::place(&w, 1300);
+        assert_eq!(three.iter().map(|c| c.1 > 0).filter(|x| *x).count(), 3);
+        assert_eq!(total, 300);
+    }
+}

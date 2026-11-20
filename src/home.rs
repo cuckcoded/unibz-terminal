@@ -25,6 +25,15 @@ fn stat_card_with_label(value: &str, caption: &str, extra: Option<&gtk::Widget>)
     (b, value_label)
 }
 
+pub const CSS: &str = "
+.due-pill { border-radius: 26px; }
+.due-pill.due-urgent { background-color: alpha(@error_bg_color, 0.18); color: @error_color; }
+.due-pill button { padding: 0 4px; min-height: 0; font-weight: normal; }
+";
+
+/// OLE action events (only things still to do) due within this many seconds are urgent.
+pub const URGENT_SECS: i64 = 24 * 3600;
+
 fn num(v: &serde_json::Value) -> Option<f64> {
     v.as_f64().filter(|x| *x > 0.0)
 }
@@ -36,8 +45,8 @@ fn weighted_average(courses: &[Course]) -> Option<f64> {
 }
 
 /// `open` selects a sidebar entry ("c:<course id>").
-pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
+pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) -> WidePage {
+    let page = WidePage::new();
     let (p, cr) = (&data.profile, &data.credits);
     let now = now_local();
 
@@ -53,7 +62,7 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         header.append(&gtk::Label::builder().label(line).css_classes(["dim-label"]).xalign(0.0).wrap(true).build());
     }
     g.add(&header);
-    page.add(&g);
+    page.add_top(&g);
 
     // Stat cards.
     let passed: Vec<&Course> = data.courses.iter().filter(|c| c.passed()).collect();
@@ -68,7 +77,7 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
     let mut exams: Vec<(&Course, (String, String))> = data.courses.iter().filter(|c| !c.passed()).filter_map(|c| Some((c, c.next_exam(&now)?))).collect();
     exams.sort_by(|a, b| a.1.0.cmp(&b.1.0));
 
-    let flow = gtk::FlowBox::builder().selection_mode(gtk::SelectionMode::None).homogeneous(true).min_children_per_line(2).max_children_per_line(4).column_spacing(12).row_spacing(12).build();
+    let flow = gtk::FlowBox::builder().selection_mode(gtk::SelectionMode::None).homogeneous(true).min_children_per_line(2).max_children_per_line(8).column_spacing(12).row_spacing(12).build();
     let bar = gtk::LevelBar::builder().min_value(0.0).max_value(ects_total.max(1.0)).value(ects_done.min(ects_total)).margin_top(6).build();
     flow.append(&stat_card(&format!("{ects_done:.0} / {ects_total:.0}"), &format!("ECTS ({:.0}%)", 100.0 * ects_done / ects_total.max(1.0)), Some(bar.upcast_ref())));
     flow.append(&stat_card(&avg30.map_or("–".into(), |a| format!("{a:.2}")), "Weighted average (out of 30)", None));
@@ -102,9 +111,21 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         }
     });
     flow.append(&card);
+
+    // Pill with OLE assignments due within 24 h that aren't done yet (filled in below with the deadlines).
+    let pill = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["card", "due-pill"]).build();
+    let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(14).margin_bottom(14).margin_start(18).margin_end(18).build();
+    let due_value = gtk::Label::builder().label("…").css_classes(["title-2"]).xalign(0.0).build();
+    let due_caption = gtk::Label::builder().label("Due within 24 h").css_classes(["caption"]).xalign(0.0).wrap(true).build();
+    let due_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    inner.append(&due_value);
+    inner.append(&due_caption);
+    inner.append(&due_list);
+    pill.append(&inner);
+    flow.append(&pill);
     let g = adw::PreferencesGroup::new();
     g.add(&flow);
-    page.add(&g);
+    page.add_top(&g);
 
     let course_row = |title: &str, sub: &str, c: &Course| {
         let r = row(title, sub);
@@ -133,13 +154,20 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
             fill(
                 &g,
                 move || moodle::call(&token, "core_calendar_get_action_events_by_timesort", &[("timesortfrom", from.to_string()), ("limitnum", "25".into())]),
-                |g, v| {
+                move |g, v| {
                     let evs = arr(&v["events"]);
                     if evs.is_empty() {
                         g.add(&row("Nothing due on OLE", ""));
                     }
+                    let urgent: Vec<&serde_json::Value> = evs.iter().filter(|e| e["timesort"].as_i64().unwrap_or(i64::MAX) - from < URGENT_SECS).collect();
+                    fill_pill(&pill, &due_value, &due_caption, &due_list, &urgent);
                     for e in evs {
-                        let r = row(&s(&e["name"]), &format!("{} · {}", fmt_ts(e["timesort"].as_i64().unwrap_or_default()), s(&e["course"]["fullname"])));
+                        let due = e["timesort"].as_i64().unwrap_or_default();
+                        let r = row(&s(&e["name"]), &format!("{} · {}", fmt_ts(due), s(&e["course"]["fullname"])));
+                        if due - from < URGENT_SECS {
+                            r.add_css_class("error");
+                            r.add_prefix(&gtk::Image::from_icon_name("alarm-symbolic"));
+                        }
                         r.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
                         r.set_activatable(true);
                         let url = s(&e["url"]);
@@ -149,7 +177,11 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
                 },
             );
         }
-        Err(e) => g.add(&row("OLE unavailable", &e)),
+        Err(e) => {
+            g.add(&row("OLE unavailable", &e));
+            due_value.set_label("–");
+            due_caption.set_label("OLE unavailable");
+        }
     }
     page.add(&g);
 
@@ -191,6 +223,28 @@ pub fn page(data: &Data, ole: Result<String, String>, open: Rc<dyn Fn(&str)>) ->
         page.add(&g);
     }
     page
+}
+
+/// Shows the urgent assignments in the stats pill (red when there are any).
+fn fill_pill(pill: &gtk::Box, value: &gtk::Label, caption: &gtk::Label, list: &gtk::Box, urgent: &[&serde_json::Value]) {
+    value.set_label(&urgent.len().to_string());
+    if urgent.is_empty() {
+        caption.set_label("Nothing due within 24 h");
+        return;
+    }
+    pill.add_css_class("due-urgent");
+    caption.set_label(if urgent.len() == 1 { "Assignment due within 24 h" } else { "Assignments due within 24 h" });
+    for e in urgent.iter().take(3) {
+        let when = glib::DateTime::from_unix_local(e["timesort"].as_i64().unwrap_or_default()).ok().and_then(|d| d.format("%a %H:%M").ok()).map(|s| s.to_string()).unwrap_or_default();
+        let label = gtk::Label::builder().label(format!("{when} · {}", s(&e["name"]))).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["caption"]).build();
+        let b = gtk::Button::builder().child(&label).css_classes(["flat"]).tooltip_text(format!("{} · {}", s(&e["name"]), s(&e["course"]["fullname"]))).build();
+        let url = s(&e["url"]);
+        b.connect_clicked(move |b| open_uri(b, &url));
+        list.append(&b);
+    }
+    if urgent.len() > 3 {
+        list.append(&gtk::Label::builder().label(format!("+{} more", urgent.len() - 3)).xalign(0.0).css_classes(["caption"]).build());
+    }
 }
 
 /// Lectures of one day, with buttons to move between days.

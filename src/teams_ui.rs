@@ -47,7 +47,7 @@ fn with<T: Send + 'static>(t: &Rc<Team>, job: impl FnOnce(&Team) -> Res<T> + Sen
 /// `actions` go into the team page header (e.g. the assign menu).
 pub fn tab(t: Rc<Team>, actions: &[gtk::Widget]) -> adw::NavigationView {
     let nav = adw::NavigationView::new();
-    let page = adw::PreferencesPage::new();
+    let page = WidePage::new();
 
     let channels = group("Channels");
     channels.set_header_suffix(Some(&link_button("Open in Teams", t.url.clone())));
@@ -94,7 +94,7 @@ pub fn tab(t: Rc<Team>, actions: &[gtk::Widget]) -> adw::NavigationView {
     );
     page.add(&sp);
 
-    nav.push(&subpage(&t.name, &page, actions));
+    nav.push(&subpage(&t.name, &page.root, actions));
     nav
 }
 

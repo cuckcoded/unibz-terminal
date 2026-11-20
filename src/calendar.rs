@@ -48,6 +48,8 @@ pub struct Event {
     pub detail: String,
     pub place: String,
     pub people: String,
+    /// Not done yet and due within 24 h.
+    pub urgent: bool,
     pub kind: Kind,
     /// Sidebar key ("c:12") or a URL to open.
     pub target: String,
@@ -70,7 +72,7 @@ pub fn sns_events(data: &Data) -> Vec<Event> {
             let (Some(start), Some(end)) = (unix(&l.start), unix(&l.end)) else { continue };
             let exam = l.kind == "EXAM";
             let title = if exam { format!("Exam · {}", c.name) } else { c.name.clone() };
-            out.push(Event { start, end, all_day: false, title, detail: l.activity.clone(), place: l.room.clone(), people: l.staff.clone(), kind: if exam { Kind::Exam } else { Kind::Lecture }, target: key.clone() });
+            out.push(Event { start, end, all_day: false, title, detail: l.activity.clone(), place: l.room.clone(), people: l.staff.clone(), urgent: false, kind: if exam { Kind::Exam } else { Kind::Lecture }, target: key.clone() });
         }
         for e in &c.exams {
             let Some(date) = s(&e["examDate"]).get(..10).map(str::to_owned) else { continue };
@@ -89,6 +91,7 @@ pub fn sns_events(data: &Data) -> Vec<Event> {
                 detail: join(&[&s(&e["examTypeDescription"]), enrolled]),
                 place: s(&e["location"]),
                 people: s(&e["examProfessorName"]),
+                urgent: false,
                 kind: Kind::Exam,
                 target: key.clone(),
             });
@@ -113,6 +116,10 @@ fn ole_events(token: &str, courses: &[(i64, String, String)], from: i64, to: i64
     let mut args = vec![("options[timestart]", from.to_string()), ("options[timeend]", to.to_string()), ("options[userevents]", "1".into()), ("options[siteevents]", "1".into())];
     args.extend(names.iter().zip(courses).map(|(n, c)| (n.as_str(), c.0.to_string())));
     let v = moodle::call(token, "core_calendar_get_calendar_events", &args)?;
+    // Action events only list what is still to do (submitted/completed ones drop out).
+    let now = glib::DateTime::now_utc().map(|d| d.to_unix()).unwrap_or_default();
+    let todo = moodle::call(token, "core_calendar_get_action_events_by_timesort", &[("timesortfrom", now.to_string()), ("timesortto", (now + crate::home::URGENT_SECS).to_string()), ("limitnum", "50".into())])?;
+    let urgent: Vec<i64> = arr(&todo["events"]).iter().filter_map(|e| e["id"].as_i64()).collect();
     Ok(arr(&v["events"])
         .iter()
         .map(|e| {
@@ -126,6 +133,7 @@ fn ole_events(token: &str, courses: &[(i64, String, String)], from: i64, to: i64
                 detail: course.map(|c| c.1.clone()).unwrap_or_default(),
                 place: String::new(),
                 people: String::new(),
+                urgent: e["id"].as_i64().is_some_and(|id| urgent.contains(&id)),
                 kind: Kind::Ole,
                 target: course.map(|c| c.2.clone()).unwrap_or_else(|| format!("{OLE}/calendar/view.php?view=day&time={start}")),
             }
@@ -174,7 +182,7 @@ fn index(events: &[Event]) -> HashMap<String, Vec<Event>> {
     by_day
 }
 
-const CSS: &str = "
+pub const CSS: &str = "
 .cal-dot { min-width: 10px; min-height: 10px; border-radius: 5px; }
 .cal-dot.cal-lecture { background-color: @accent_bg_color; }
 .cal-dot.cal-exam { background-color: @error_bg_color; }
@@ -193,18 +201,9 @@ const CSS: &str = "
 .cal-event.cal-exam { border-left-color: @error_bg_color; background-color: alpha(@error_bg_color, 0.14); }
 .cal-event.cal-ole { border-left-color: @warning_bg_color; background-color: alpha(@warning_bg_color, 0.16); }
 .cal-event .cal-title { font-weight: bold; }
+.cal-event.cal-urgent, .cal-chip.cal-urgent { border-left-color: @error_bg_color; background-color: alpha(@error_bg_color, 0.3); color: @error_color; }
 ";
 
-fn install_css() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let p = gtk::CssProvider::new();
-        p.load_from_string(CSS);
-        if let Some(d) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(&d, &p, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        }
-    });
-}
 
 fn dot(kind: Kind) -> gtk::Box {
     gtk::Box::builder().css_classes(["cal-dot", kind.css()]).valign(gtk::Align::Center).build()
@@ -304,7 +303,10 @@ impl Cal {
                 v.append(&line);
             }
         }
-        let b = gtk::Button::builder().child(&v).css_classes(["cal-event", e.kind.css()]).tooltip_text(join(&[&when(e), &e.title, &e.detail, &e.place, &e.people])).build();
+        if e.urgent {
+            v.prepend(&gtk::Label::builder().label("Due within 24 h").xalign(0.0).css_classes(["caption-heading"]).build());
+        }
+        let b = gtk::Button::builder().child(&v).css_classes(if e.urgent { vec!["cal-event", e.kind.css(), "cal-urgent"] } else { vec!["cal-event", e.kind.css()] }).tooltip_text(join(&[&when(e), &e.title, &e.detail, &e.place, &e.people])).build();
         let (weak, target) = (Rc::downgrade(self), e.target.clone());
         b.connect_clicked(move |b| {
             if let Some(c) = weak.upgrade() {
@@ -405,7 +407,7 @@ impl Cal {
             b.append(&num);
             let evs = self.on(&d);
             for e in evs.iter().take(3) {
-                b.append(&gtk::Label::builder().label(format!("{} {}", when(e), e.title)).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["cal-chip", e.kind.css()]).build());
+                b.append(&gtk::Label::builder().label(format!("{} {}", when(e), e.title)).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(if e.urgent { vec!["cal-chip", e.kind.css(), "cal-urgent"] } else { vec!["cal-chip", e.kind.css()] }).build());
             }
             if evs.len() > 3 {
                 b.append(&gtk::Label::builder().label(format!("+{} more", evs.len() - 3)).xalign(0.0).css_classes(["caption", "dim-label"]).build());
@@ -482,7 +484,6 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::Widget {
 
 /// `open` selects a sidebar entry.
 pub fn page(data: &Data, access: &api::Access, open: Rc<dyn Fn(&str)>) -> gtk::Widget {
-    install_css();
     let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).build();
 
     // Toolbar: previous/today/next, title, view switcher.
@@ -594,7 +595,7 @@ mod tests {
     #[test]
     fn index_groups_by_local_day_and_sorts() {
         let t = |iso: &str| unix(iso).unwrap();
-        let ev = |start, all_day| Event { start, end: start, all_day, title: String::new(), detail: String::new(), place: String::new(), people: String::new(), kind: Kind::Ole, target: String::new() };
+        let ev = |start, all_day| Event { start, end: start, all_day, title: String::new(), detail: String::new(), place: String::new(), people: String::new(), urgent: false, kind: Kind::Ole, target: String::new() };
         let idx = index(&[ev(t("2026-11-20T14:00:00"), false), ev(t("2026-11-20T09:00:00"), false), ev(t("2026-11-20T00:00:00"), true), ev(t("2026-11-21T08:00:00"), false)]);
         let day = &idx["2026-11-20"];
         assert_eq!(day.len(), 3);

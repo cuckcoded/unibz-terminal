@@ -64,6 +64,7 @@ fn status(title: &str, desc: &str, spinner: bool) -> adw::StatusPage {
 }
 
 fn build(app: &adw::Application) {
+    load_css(&[calendar::CSS, home::CSS]);
     let list = gtk::ListBox::builder().css_classes(["navigation-sidebar"]).build();
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.set_tooltip_text(Some("Reload"));
@@ -243,7 +244,7 @@ fn show(ui: &Rc<Ui>, key: &str) {
         "k" => ("Calendar".to_owned(), toolbar(&calendar::page(&state.data.borrow(), &state.access, open), Some(adw::WindowTitle::new("Calendar", "").upcast_ref()), &[])),
         "h" => {
             let ole = state.access.moodle.clone();
-            ("Home".to_owned(), toolbar(&home::page(&state.data.borrow(), ole, open), Some(adw::WindowTitle::new("Home", "").upcast_ref()), &[]))
+            ("Home".to_owned(), toolbar(&home::page(&state.data.borrow(), ole, open).root, Some(adw::WindowTitle::new("Home", "").upcast_ref()), &[]))
         }
         "m" => ("Mensa".to_owned(), toolbar(&mensa_ui::page(), Some(adw::WindowTitle::new("Mensa", "").upcast_ref()), &[])),
         "c" => {
@@ -303,7 +304,7 @@ fn team_tab(state: &State, t: &(String, String, String), folder: &str, menu: gtk
 }
 
 fn course_page(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::ToolbarView {
-    let mut pages = vec![("mySNS".to_string(), "x-office-document-symbolic", overview(ui, state, c).upcast())];
+    let mut pages = vec![("mySNS".to_string(), "x-office-document-symbolic", overview(ui, state, c).root.upcast())];
     for (id, name) in &c.moodle {
         let title = if c.moodle.len() > 1 { format!("OLE: {name}") } else { "OLE".into() };
         let menu = link_menu(ui, state, Link::Ole(*id, name.clone()), Some(c.id));
@@ -535,8 +536,8 @@ fn suggestions(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> Option<adw::Prefer
     Some(g)
 }
 
-fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
+fn overview(ui: &Rc<Ui>, state: &Rc<State>, c: &Course) -> WidePage {
+    let page = WidePage::new();
     let data = state.data.borrow();
 
     let now = now_local();

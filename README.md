@@ -28,6 +28,10 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
   - It shows mySNS lectures and exams and OLE calendar events (deadlines, course and personal events), color-coded by source.
   - Events are cards showing time, course, type, room and lecturer. A lunch bar (12:00–13:30) separates morning and afternoon and opens the Mensa page.
   - Click an event to open its course. Click a day in the month or year view to open it.
+- **Due soon:**
+  - OLE assignments due within 24 hours that you haven't submitted or completed are shown in red, both on Home and in the calendar.
+  - Among the Home stats, a pill lists these assignments.
+- **Wide screens:** Home, course overviews and the OLE and Teams course tabs place their sections in up to three columns as the window gets wider.
 - **Home lectures:** Home lists one day of lectures at a time, with buttons for the previous day, today and the next day.
 - **Mensa:**
   - Your credit, read from the mensa reserved area. Sign-in uses the "SNS Access UNIBZ" button with your existing Microsoft session. The credit also appears on Home.

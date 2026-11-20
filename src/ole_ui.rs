@@ -35,7 +35,7 @@ impl Ole {
 /// `actions` go into the course page header (e.g. the assign menu).
 pub fn tab(o: Rc<Ole>, actions: &[gtk::Widget]) -> adw::NavigationView {
     let nav = adw::NavigationView::new();
-    let page = adw::PreferencesPage::new();
+    let page = WidePage::new();
     let g = group("Course");
     g.set_header_suffix(Some(&link_button("Open in browser", format!("{OLE}/course/view.php?id={}", o.course))));
     for (title, icon, which) in [("Grades", "starred-symbolic", 0), ("Participants", "system-users-symbolic", 1), ("Upcoming deadlines", "alarm-symbolic", 2), ("Course page on OLE", "web-browser-symbolic", 3)] {
@@ -116,7 +116,7 @@ pub fn tab(o: Rc<Ole>, actions: &[gtk::Widget]) -> adw::NavigationView {
             }
         },
     );
-    nav.push(&subpage(&o.name, &page, actions));
+    nav.push(&subpage(&o.name, &page.root, actions));
     nav
 }
 
