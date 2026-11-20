@@ -14,8 +14,9 @@ use crate::auth::{self, Res};
 use crate::mensa::{self, AREA, BASE, DINNER, Dish, LUNCH, SNS_LOGIN};
 use crate::ui::*;
 
-/// Signs in through "SNS Access UNIBZ" in a visible window and returns the reserved area's text.
-/// Microsoft usually completes on its own from the stored session; otherwise the user signs in there.
+/// Signs in through "SNS Access UNIBZ" in an off-screen browser and returns the reserved area's text.
+/// Microsoft usually completes on its own from the stored session; the window only appears if a
+/// Microsoft page sits waiting for the user.
 async fn login_and_read() -> Res<String> {
     let view = auth::web_view();
     let win = gtk::Window::builder().title("Signing in to the mensa…").default_width(520).default_height(720).child(&view).build();
@@ -32,7 +33,12 @@ async fn login_and_read() -> Res<String> {
     };
     // Each step is decided from where we landed, so unexpected redirects don't derail it.
     let (tried_login, landings) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)));
+    let loads = Rc::new(Cell::new(0u32));
+    let weak_win = win.downgrade();
     view.connect_load_changed(move |v, ev| {
+        if ev == webkit6::LoadEvent::Started {
+            loads.set(loads.get() + 1);
+        }
         if ev != webkit6::LoadEvent::Finished {
             return;
         }
@@ -67,6 +73,14 @@ async fn login_and_read() -> Res<String> {
             } else {
                 v.load_uri(AREA);
             }
+        } else {
+            // On Microsoft: if nothing moves on for a few seconds, it needs the user.
+            let (n, loads, weak_win) = (loads.get(), loads.clone(), weak_win.clone());
+            glib::timeout_add_local_once(Duration::from_secs(4), move || {
+                if let Some(w) = weak_win.upgrade().filter(|_| loads.get() == n) {
+                    w.present();
+                }
+            });
         }
     });
     win.connect_close_request(move |_| {
@@ -74,7 +88,6 @@ async fn login_and_read() -> Res<String> {
         glib::Propagation::Proceed
     });
     view.load_uri(AREA);
-    win.present();
     let r = glib::future_with_timeout(Duration::from_secs(180), rx).await;
     win.close();
     match r {
@@ -84,16 +97,22 @@ async fn login_and_read() -> Res<String> {
     }
 }
 
-/// Reads the balance with the stored mensa session; signs in only when that session is gone.
+async fn balance_with(cookie: String) -> Res<Option<f64>> {
+    if cookie.is_empty() {
+        return Ok(None);
+    }
+    gtk::gio::spawn_blocking(move || mensa::fetch_balance(&cookie)).await.unwrap_or_else(|_| Err("background job panicked".into()))
+}
+
+/// Reads the balance with a saved mensa session; signs in (off-screen) only when that session has expired.
 async fn fetch_credit() -> Res<f64> {
-    let cookie = auth::cookie_header(AREA).await;
-    if !cookie.is_empty() {
-        let r = gtk::gio::spawn_blocking(move || mensa::fetch_balance(&cookie)).await.unwrap_or_else(|_| Err("background job panicked".into()))?;
-        if let Some(b) = r {
-            return Ok(b);
-        }
+    // The mensa's session cookie is session-only, so the browser forgets it on exit; keep our own copy.
+    if let Some(b) = balance_with(auth::stored("mensa").unwrap_or_default()).await? {
+        return Ok(b);
     }
     let text = login_and_read().await?;
+    let cookie = auth::cookie_header(AREA).await;
+    auth::store("mensa", (!cookie.is_empty()).then_some(cookie));
     mensa::parse_balance(&text).ok_or_else(|| "could not find the balance on the reserved-area page".into())
 }
 

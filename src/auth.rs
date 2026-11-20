@@ -97,7 +97,7 @@ pub fn stored(key: &str) -> Option<String> {
     .cloned()
 }
 
-fn store(key: &str, val: Option<String>) {
+pub fn store(key: &str, val: Option<String>) {
     use std::os::unix::fs::OpenOptionsExt;
     let mut t = TOKENS.lock().unwrap();
     let map = t.get_or_insert_with(HashMap::new);
