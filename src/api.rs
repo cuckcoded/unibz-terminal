@@ -317,27 +317,40 @@ pub fn moodle_contents(a: &Access, course: i64) -> Res<Vec<(String, Vec<Item>)>>
 }
 
 /// Every file in a team's SharePoint drive (channel folders included).
-pub fn team_files(a: &Access, group: &str) -> Res<Vec<Item>> {
+pub fn team_files(a: &Access, team: &str) -> Res<Vec<Item>> {
     let token = a.graph.clone()?;
     let mut out = Vec::new();
-    walk(&token, &format!("{GRAPH}/groups/{group}/drive/root/children"), group, "", 0, &mut out)?;
+    // /groups/{id}/drive 404s for class teams; each channel's filesFolder resolves the real drive.
+    let channels = get(&format!("{GRAPH}/teams/{team}/channels?$select=id,displayName"), Some(&token))?;
+    for ch in arr(&channels["value"]) {
+        let name = s(&ch["displayName"]);
+        let folder = match get(&format!("{GRAPH}/teams/{team}/channels/{}/filesFolder", s(&ch["id"])), Some(&token)) {
+            Ok(f) => f,
+            Err(e) => {
+                out.push(Item { title: format!("{name}: files unavailable"), subtitle: e, download: None, web: None });
+                continue;
+            }
+        };
+        let drive = s(&folder["parentReference"]["driveId"]);
+        walk(&token, &drive, &s(&folder["id"]), &format!("{name}/"), 0, &mut out)?;
+    }
     out.sort_by(|a, b| (&a.subtitle, &a.title).cmp(&(&b.subtitle, &b.title)));
     Ok(out)
 }
 
-fn walk(token: &str, url: &str, group: &str, path: &str, depth: u32, out: &mut Vec<Item>) -> Res<()> {
-    let mut next = Some(url.to_owned());
+fn walk(token: &str, drive: &str, item: &str, path: &str, depth: u32, out: &mut Vec<Item>) -> Res<()> {
+    let mut next = Some(format!("{GRAPH}/drives/{drive}/items/{item}/children"));
     while let Some(u) = next {
         let v = get(&u, Some(token))?;
         for it in arr(&v["value"]) {
             let name = s(&it["name"]);
             if it.get("folder").is_some() {
                 if depth < 6 {
-                    walk(token, &format!("{GRAPH}/groups/{group}/drive/items/{}/children", s(&it["id"])), group, &format!("{path}{name}/"), depth + 1, out)?;
+                    walk(token, drive, &s(&it["id"]), &format!("{path}{name}/"), depth + 1, out)?;
                 }
             } else {
                 out.push(Item {
-                    subtitle: if path.is_empty() { "/".into() } else { path.trim_end_matches('/').into() },
+                    subtitle: path.trim_end_matches('/').into(),
                     download: it["@microsoft.graph.downloadUrl"].as_str().map(|d| (d.to_owned(), name.clone())),
                     web: it["webUrl"].as_str().map(Into::into),
                     title: name,
