@@ -278,7 +278,7 @@ fn tabs(pages: Vec<(String, &str, gtk::Widget)>, extra: &[gtk::Widget]) -> adw::
         stack.add_titled_with_icon(w, Some(&format!("tab{i}")), title, icon);
     }
     let switcher = adw::ViewSwitcher::builder().stack(&stack).policy(adw::ViewSwitcherPolicy::Wide).build();
-    toolbar(&stack, Some(switcher.upcast_ref()), extra)
+    toolbar(&with_preview(&stack), Some(switcher.upcast_ref()), extra)
 }
 
 fn ole_tab(state: &State, id: i64, name: &str, folder: &str, menu: gtk::Widget) -> gtk::Widget {

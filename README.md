@@ -31,6 +31,10 @@ Refresh tokens are kept in `~/.config/unibz-terminal/tokens.json` (mode 0600).
 - **Due soon:**
   - OLE assignments due within 24 hours that you haven't submitted or completed are shown in red, both on Home and in the calendar.
   - Among the Home stats, a pill lists these assignments.
+- **File preview:**
+  - In a course page, opening a file (OLE resource or folder, Teams/SharePoint file, attachment in a post) shows it in a pane on the right instead of another app.
+  - PDFs, images, text and code, HTML, audio and video show directly. Word, PowerPoint, Excel and OpenDocument files are converted to PDF with LibreOffice, if it's installed.
+  - The pane has buttons to open the file in another app and to close the preview.
 - **Wide screens:** Home, course overviews and the OLE and Teams course tabs place their sections in up to three columns as the window gets wider.
 - **Home lectures:** Home lists one day of lectures at a time, with buttons for the previous day, today and the next day.
 - **Mensa:**

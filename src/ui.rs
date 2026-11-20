@@ -70,18 +70,140 @@ pub fn fill<T: Send + 'static>(g: &adw::PreferencesGroup, job: impl FnOnce() -> 
 }
 
 /// Opens the local copy of a file, downloading it first if missing or outdated.
+/// Downloads (or reuses the cached copy) and shows the file in the course page's preview pane,
+/// or opens it in another app where there is no preview pane.
 pub fn download_and_open(w: &impl IsA<gtk::Widget>, dl: Dl, folder: String, on_done: impl FnOnce(Res<()>) + 'static) {
-    let win = window_of(w);
+    let w = w.clone().upcast::<gtk::Widget>();
     spawn(
         move || api::fetch_file(&folder, &dl),
         move |r| match r {
             Ok(path) => {
-                gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
+                if !show_preview(&w, &path) {
+                    launch_file(&w, &path);
+                }
                 on_done(Ok(()))
             }
             Err(e) => on_done(Err(e)),
         },
     );
+}
+
+fn launch_file(w: &gtk::Widget, path: &std::path::Path) {
+    gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(window_of(w).as_ref(), None::<&gio::Cancellable>, |_| {});
+}
+
+const PREVIEW_HOST: &str = "preview-host";
+
+/// Wraps a course page so files opened inside it are previewed on the right.
+pub fn with_preview(content: &impl IsA<gtk::Widget>) -> adw::OverlaySplitView {
+    adw::OverlaySplitView::builder()
+        .content(content)
+        .sidebar_position(gtk::PackType::End)
+        .show_sidebar(false)
+        .sidebar_width_fraction(0.5)
+        .min_sidebar_width(360.0)
+        .max_sidebar_width(1400.0)
+        .name(PREVIEW_HOST)
+        .build()
+}
+
+/// Shows `path` in the preview pane of the course page `from` is in; false if it isn't in one.
+fn show_preview(from: &gtk::Widget, path: &std::path::Path) -> bool {
+    let Some(split) = from.ancestor(adw::OverlaySplitView::static_type()).and_downcast::<adw::OverlaySplitView>().filter(|s| s.widget_name() == PREVIEW_HOST) else {
+        return false;
+    };
+    let bar = gtk::Box::builder().spacing(6).margin_start(12).margin_end(6).margin_top(6).margin_bottom(6).build();
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    bar.append(&gtk::Label::builder().label(&name).tooltip_text(&name).css_classes(["heading"]).ellipsize(gtk::pango::EllipsizeMode::Middle).hexpand(true).xalign(0.0).build());
+    let open = gtk::Button::builder().icon_name("document-open-symbolic").tooltip_text("Open in another app").css_classes(["flat"]).build();
+    let p = path.to_owned();
+    open.connect_clicked(move |b| launch_file(b.upcast_ref(), &p));
+    let close = gtk::Button::builder().icon_name("window-close-symbolic").tooltip_text("Close preview").css_classes(["flat"]).build();
+    let s2 = split.clone();
+    close.connect_clicked(move |_| s2.set_show_sidebar(false));
+    bar.append(&open);
+    bar.append(&close);
+    let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    pane.append(&bar);
+    pane.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let content = preview_content(path);
+    content.set_vexpand(true);
+    pane.append(&content);
+    split.set_sidebar(Some(&pane));
+    split.set_show_sidebar(true);
+    true
+}
+
+/// Office formats are previewed as PDF through LibreOffice.
+const OFFICE: [&str; 11] = ["doc", "docx", "ppt", "pptx", "pps", "ppsx", "xls", "xlsx", "odt", "odp", "ods"];
+
+fn pdf_view(path: &std::path::Path) -> gtk::Widget {
+    let v = webkit6::WebView::new();
+    v.load_uri(&gio::File::for_path(path).uri());
+    v.upcast()
+}
+
+fn no_preview(path: &std::path::Path, why: &str) -> gtk::Widget {
+    let p = path.to_owned();
+    let b = gtk::Button::builder().label("Open in another app").halign(gtk::Align::Center).css_classes(["pill", "suggested-action"]).build();
+    b.connect_clicked(move |b| launch_file(b.upcast_ref(), &p));
+    adw::StatusPage::builder().icon_name("text-x-generic-symbolic").title("No preview").description(esc(why)).child(&b).build().upcast()
+}
+
+fn preview_content(path: &std::path::Path) -> gtk::Widget {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ctype = gio::content_type_guess(Some(path), None).0;
+    let mime = gio::content_type_get_mime_type(&ctype).map(|m| m.to_string()).unwrap_or_default();
+    if mime.starts_with("image/") {
+        return gtk::Picture::builder().file(&gio::File::for_path(path)).content_fit(gtk::ContentFit::Contain).can_shrink(true).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build().upcast();
+    }
+    if mime == "application/pdf" || mime == "text/html" {
+        return pdf_view(path);
+    }
+    if mime.starts_with("video/") || mime.starts_with("audio/") {
+        return gtk::Video::builder().file(&gio::File::for_path(path)).autoplay(false).build().upcast();
+    }
+    if OFFICE.contains(&ext.as_str()) {
+        let holder = adw::Bin::builder().child(&adw::Spinner::builder().width_request(32).height_request(32).halign(gtk::Align::Center).valign(gtk::Align::Center).build()).build();
+        let (src, orig, h) = (path.to_owned(), path.to_owned(), holder.clone());
+        spawn(move || office_to_pdf(&src), move |r| {
+            h.set_child(Some(&match r {
+                Ok(pdf) => pdf_view(&pdf),
+                Err(e) => no_preview(&orig, &e),
+            }))
+        });
+        return holder.upcast();
+    }
+    if gio::content_type_is_a(&ctype, "text/plain") || mime == "application/json" || mime.ends_with("+xml") || mime == "application/xml" {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(2 << 20)]).to_string();
+        let tv = gtk::TextView::builder().editable(false).monospace(true).wrap_mode(gtk::WrapMode::WordChar).left_margin(12).right_margin(12).top_margin(12).bottom_margin(12).build();
+        tv.buffer().set_text(&text);
+        return gtk::ScrolledWindow::builder().child(&tv).build().upcast();
+    }
+    no_preview(path, &format!("This app can't show {} files.", if ext.is_empty() { "these" } else { &ext }))
+}
+
+/// Converts an Office document to PDF (cached next to other previews); needs LibreOffice.
+fn office_to_pdf(src: &std::path::Path) -> Res<std::path::PathBuf> {
+    let key = glib::compute_checksum_for_string(glib::ChecksumType::Sha256, src.to_string_lossy().as_ref()).map(|k| k.to_string()).unwrap_or_default();
+    let dir = glib::user_cache_dir().join("unibz-terminal").join("previews").join(key.get(..16).unwrap_or("x"));
+    let pdf = dir.join(src.with_extension("pdf").file_name().unwrap_or_default());
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if pdf.is_file() && modified(&pdf) >= modified(src) {
+        return Ok(pdf);
+    }
+    std::fs::create_dir_all(&dir).map_err(crate::auth::err)?;
+    // A separate profile, so a LibreOffice window that is already open doesn't swallow the job.
+    let profile = gio::File::for_path(glib::user_cache_dir().join("unibz-terminal").join("lo-profile")).uri();
+    let out = std::process::Command::new("soffice")
+        .arg(format!("-env:UserInstallation={profile}"))
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(&dir)
+        .arg(src)
+        .output()
+        .map_err(|_| "Install LibreOffice to preview Office documents.".to_string())?;
+    if pdf.is_file() { Ok(pdf) } else { Err(format!("LibreOffice could not convert it: {}", String::from_utf8_lossy(&out.stderr).trim())) }
 }
 
 fn file_icon(cached: bool) -> (&'static str, &'static str) {
